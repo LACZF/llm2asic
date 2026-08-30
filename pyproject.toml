@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm2asic"
+version = "0.1.0"
+description = "Compile LLM weights into custom RTL hardware (LLM -> RTL compiler)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "LACZF" }]
+dependencies = [
+    "numpy>=1.21",
+    "PyYAML>=5.4",
+    "Jinja2>=3.0",
+]
+
+[project.optional-dependencies]
+torch = ["torch", "safetensors"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+llm2asic = "llm2asic.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["llm2asic*"]
+
+[tool.setuptools.package-data]
+llm2asic = ["rtl_backend/templates/*.tpl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
