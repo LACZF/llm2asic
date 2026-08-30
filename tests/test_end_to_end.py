@@ -96,9 +96,11 @@ def test_generated_rtl_compiles(qmodel):
     backend_run(mpath, cfg, tokens=toks)
     rdir = os.path.join(out, "rtl")
     mod = f"{qm.config['name']}_accel"
+    gemv_files = sorted(fn for fn in os.listdir(rdir)
+                        if fn.startswith("gemv_") and fn.endswith(".sv"))
     cmd = ["iverilog", "-g2012", "-o", "/dev/null",
            os.path.join(rdir, f"{mod}.sv"),
-           os.path.join(rdir, "gemv.sv"),
+           *[os.path.join(rdir, fn) for fn in gemv_files],
            os.path.join(rdir, "rmsnorm.sv"),
            os.path.join(rdir, "attn.sv"),
            os.path.join(rdir, "sim_tb.sv")]

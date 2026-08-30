@@ -140,9 +140,12 @@ def run(model_path: str,
 
         # 5. 仿真（iverilog + vvp）
         if cfg.enable_sim:
+            gemv_files = sorted(fn for fn in os.listdir(rdir)
+                                if fn.startswith("gemv_") and fn.endswith(".sv"))
             _run_tool(["iverilog", "-g2012", "-o", "sim.vvp",
-                       f"{modname}.sv", "gemv.sv", "rmsnorm.sv", "attn.sv",
-                       "sim_tb.sv"], rdir, what="iverilog 编译")
+                       f"{modname}.sv", *gemv_files,
+                       "rmsnorm.sv", "attn.sv", "sim_tb.sv"],
+                      rdir, what="iverilog 编译")
             proc = subprocess.run(["vvp", "sim.vvp"], cwd=rdir,
                                   capture_output=True, text=True)
             if proc.returncode != 0 or "SIM_DONE" not in proc.stdout:

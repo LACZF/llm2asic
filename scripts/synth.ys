@@ -1,0 +1,20 @@
+# LLM2ASIC Yosys 综合脚本（开源流程，design/rtl_backend.md §6.2）
+#
+# 运行环境：必须在 RTL 目录（含 *.sv 与 *.mem，$readmemh 相对路径）下执行。
+#   cd build_out/rtl && yosys -s <repo>/scripts/synth.ys
+#
+# 约定：
+#   - 顶层模块：{name}_accel（本例 llama_tiny_accel）
+#   - 输出：../synth/netlist.v（最终门级网表）、../synth/util_report.txt（资源占用）
+#   - 无 string 参数、无 unpacked 端口（Yosys 0.68 限制），ROM 文件名为字面量。
+
+read_verilog -sv llama_tiny_accel.sv
+read_verilog -sv gemv_0.sv gemv_1.sv gemv_2.sv gemv_3.sv gemv_4.sv gemv_5.sv
+read_verilog -sv gemv_6.sv gemv_7.sv gemv_8.sv gemv_9.sv gemv_10.sv gemv_11.sv gemv_12.sv
+read_verilog -sv rmsnorm.sv
+read_verilog -sv attn.sv
+
+synth_xilinx -top llama_tiny_accel -family xc7 -flatten -nowidelut
+
+write_verilog -noattr ../synth/netlist.v
+tee -o ../synth/util_report.txt stat -tech xilinx

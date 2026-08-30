@@ -49,10 +49,11 @@ _RR_FN = r"""
 
 GEMV_TEMPLATE = r'''
 // gemv：顺序 GEMV。x 打包输入，yout 打包输出。
-module gemv #(
+// ROM 文件名以字面量硬编码（Yosys 不支持 string 类型参数），故每个引擎
+// 输出独立文件 gemv_<idx>.sv 且模块名唯一。
+module @@GMOD@@ #(
   parameter C_IN=16, parameter C_OUT=16, parameter SIMD=8, parameter WW=4,
-  parameter ACT=24, parameter RS=16, parameter WORDS=32, parameter NUM_BITS=24,
-  parameter string WF="", parameter string SF=""
+  parameter ACT=24, parameter RS=16, parameter WORDS=32, parameter NUM_BITS=24
 )(
   input logic clk, input logic rst_n, input logic en,
   input logic signed [C_IN*ACT-1:0] x,
@@ -63,7 +64,7 @@ module gemv #(
   localparam WPR = (C_IN + SIMD - 1) / SIMD;
   logic [WW*SIMD-1:0] wrom [0:WORDS-1];
   logic [NUM_BITS-1:0] nrom [0:C_OUT-1];
-  initial begin $readmemh(WF, wrom); $readmemh(SF, nrom); end
+  initial begin $readmemh("@@WF@@", wrom); $readmemh("@@SF@@", nrom); end
 
   function automatic logic signed [63:0] chunk_mac(input int oo, input int cc);
     integer j; logic signed [31:0] w; logic signed [63:0] p;
@@ -72,7 +73,7 @@ module gemv #(
       w = $signed({ {32-WW{ wrom[oo*WPR+cc][j*WW+WW-1] }}, wrom[oo*WPR+cc][j*WW +: WW] });
       p = p + w * $signed(x[(cc*SIMD+j)*ACT +: ACT]);
     end
-    return p;
+    chunk_mac = p;
   endfunction
 
   localparam S_IDLE=0, S_MAC=1, S_REQ=2;
@@ -386,10 +387,26 @@ module @@MODNAME@@ #(
   parameter F=@@F@@, parameter RS=@@RS@@, parameter RR=@@RR@@, parameter ACT=@@ACT@@
 )(
   input logic clk, input logic rst_n, input logic start,
-  input logic [15:0] token_ram [0:SEQ-1],
+  // 展平（flat）端口：token_ram[i] <=> token_flat[i*16 +: 16]
+  input logic [SEQ*16-1:0] token_flat,
   output logic done,
-  output logic signed [27:0] logit_bank [0:SEQ-1][0:VOCAB-1]
+  // logit_bank[t][v] <=> logit_flat[(t*VOCAB+v)*28 +: 28]
+  output logic signed [SEQ*VOCAB*28-1:0] logit_flat
 );
+  // ---------- 端口解包（unpacked 视图）----------
+  logic [15:0] token_ram [0:SEQ-1];
+  logic signed [27:0] logit_bank [0:SEQ-1][0:VOCAB-1];
+  genvar gt_f, gv_f, gi_f;
+  generate
+    for (gi_f=0; gi_f<SEQ; gi_f=gi_f+1) begin : gtok
+      assign token_ram[gi_f] = token_flat[gi_f*16 +: 16];
+    end
+    for (gt_f=0; gt_f<SEQ; gt_f=gt_f+1) begin : glog_t
+      for (gv_f=0; gv_f<VOCAB; gv_f=gv_f+1) begin : glog_v
+        assign logit_flat[(gt_f*VOCAB+gv_f)*28 +: 28] = logit_bank[gt_f][gv_f];
+      end
+    end
+  endgenerate
 
   // ---------- 激活向量 ----------
   logic signed [ACT-1:0] h   [0:H-1];
@@ -588,9 +605,8 @@ def _emit_top(qmodel, cfg: dict) -> str:
             f"  logic signed [{c_out*24-1}:0] gy_{idx};")
         words = c_out * ((c_in + simd - 1) // simd)
         gemv_insts.append(
-            f"  gemv #(.C_IN({c_in}),.C_OUT({c_out}),.SIMD({simd}),.WW({ww}),.ACT(24),"
-            f".RS({REQUANT_S}),.WORDS({words}),.NUM_BITS(24),"
-            f'.WF("{qw.rom_file}"),.SF("{qw.scale_rom_file}")) '
+            f"  gemv_{idx} #(.C_IN({c_in}),.C_OUT({c_out}),.SIMD({simd}),.WW({ww}),.ACT(24),"
+            f".RS({REQUANT_S}),.WORDS({words}),.NUM_BITS(24)) "
             f"u_gv{idx}(.clk(clk),.rst_n(rst_n),.en(gen_{idx}),"
             f".x(gx_{idx}),.yout(gy_{idx}),.done(gd_{idx}));")
         src = inp_of[key]
@@ -681,11 +697,25 @@ module tb;
   logic [15:0] token_ram [0:SEQ-1];
   logic done;
   logic signed [27:0] logit_bank [0:SEQ-1][0:VOCAB-1];
+  // flat 端口（DUT 端口已展平，便于综合）
+  logic [SEQ*16-1:0] token_flat;
+  logic signed [SEQ*VOCAB*28-1:0] logit_flat;
+  genvar gi_f, gt_f, gv_f;
+  generate
+    for (gi_f=0; gi_f<SEQ; gi_f=gi_f+1) begin : gtok
+      assign token_flat[gi_f*16 +: 16] = token_ram[gi_f];
+    end
+    for (gt_f=0; gt_f<SEQ; gt_f=gt_f+1) begin : glog_t
+      for (gv_f=0; gv_f<VOCAB; gv_f=gv_f+1) begin : glog_v
+        assign logit_bank[gt_f][gv_f] = logit_flat[(gt_f*VOCAB+gv_f)*28 +: 28];
+      end
+    end
+  endgenerate
   always #5 clk = ~clk;
 
   {modname} dut (
-    .clk(clk), .rst_n(rst_n), .start(start), .token_ram(token_ram),
-    .done(done), .logit_bank(logit_bank)
+    .clk(clk), .rst_n(rst_n), .start(start), .token_flat(token_flat),
+    .done(done), .logit_flat(logit_flat)
   );
 
   int fid;
@@ -707,7 +737,9 @@ endmodule
 '''
 
 
-def _fill_module(s: str, qmodel) -> str:
+def _fill_module(s: str, qmodel, **kw) -> str:
+    for k, v in kw.items():
+        s = s.replace("@@" + k + "@@", str(v))
     return (s.replace("@@RSQRT_MAX@@", str(qmodel.luts.rsqrt.shape[0] - 1))
              .replace("@@EXPMAX@@", str(qmodel.luts.exp_neg.shape[0] - 1))
              .replace("@@RECMAX@@", str(qmodel.luts.recip2.shape[0] - 1))
@@ -721,9 +753,18 @@ def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
     rdir = os.path.join(out_dir, backend_dir)
     os.makedirs(rdir, exist_ok=True)
     top = _emit_top(qmodel, cfg)
+
+    # 每个 gemv 引擎一个独立模块（文件名硬编码，兼容 Yosys）
+    engine_list = sorted(qmodel.engines.items())
+    gemv_files = {}
+    for idx, (key, qw) in enumerate(engine_list):
+        gemv_files[f"gemv_{idx}.sv"] = _fill_module(
+            GEMV_TEMPLATE, qmodel,
+            GMOD=f"gemv_{idx}", WF=qw.rom_file, SF=qw.scale_rom_file)
+
     files = {
         f"{modname}.sv": top,
-        "gemv.sv": _fill_module(GEMV_TEMPLATE, qmodel),
+        **gemv_files,
         "rmsnorm.sv": _fill_module(RMSNORM_TEMPLATE, qmodel),
         "attn.sv": _fill_module(ATTN_TEMPLATE, qmodel),
         "sim_tb.sv": _emit_tb(qmodel, cfg, modname),
