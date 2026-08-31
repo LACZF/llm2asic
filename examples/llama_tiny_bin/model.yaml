@@ -1,0 +1,63 @@
+head_dim: 4
+hidden: 16
+max_seq_len: 8
+name: llama_tiny
+norm_eps: 1.0e-05
+num_heads: 4
+num_layers: 2
+rope_theta: 10000.0
+tied_embedding: false
+vocab_size: 32
+weights:
+  final_norm.weight:
+  - 16
+  layers.0.input_layernorm.weight:
+  - 16
+  layers.0.mlp.down_proj.weight:
+  - 16
+  - 16
+  layers.0.mlp.gate_proj.weight:
+  - 16
+  - 16
+  layers.0.mlp.up_proj.weight:
+  - 16
+  - 16
+  layers.0.post_attention_layernorm.weight:
+  - 16
+  layers.0.self_attn.k_proj.weight:
+  - 16
+  - 16
+  layers.0.self_attn.q_proj.weight:
+  - 16
+  - 16
+  layers.0.self_attn.v_proj.weight:
+  - 16
+  - 16
+  layers.1.input_layernorm.weight:
+  - 16
+  layers.1.mlp.down_proj.weight:
+  - 16
+  - 16
+  layers.1.mlp.gate_proj.weight:
+  - 16
+  - 16
+  layers.1.mlp.up_proj.weight:
+  - 16
+  - 16
+  layers.1.post_attention_layernorm.weight:
+  - 16
+  layers.1.self_attn.k_proj.weight:
+  - 16
+  - 16
+  layers.1.self_attn.q_proj.weight:
+  - 16
+  - 16
+  layers.1.self_attn.v_proj.weight:
+  - 16
+  - 16
+  lm_head.weight:
+  - 32
+  - 16
+  wte:
+  - 32
+  - 16

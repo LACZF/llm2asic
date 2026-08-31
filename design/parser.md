@@ -40,10 +40,18 @@
 
 | 来源 | 加载方式 | 说明 |
 |------|---------|------|
-| `torch.nn.Module` | `torch.export.export()` | **首选**：得到扁平 Export IR、状态字典、shape |
-| `.safetensors` + `config.json` | `transformers` + `safetensors` | 反序列化权重；结构由 `config.json` 重建 |
-| `.bin`（PyTorch 状态字典） | `torch.load` | 同上，权重为 dict 形式 |
-| `.onnx` | `onnx.load` | 得到 Protobuf 图，覆盖非 PyTorch 来源 |
+| `model.yaml` + `.npz` | 纯 NumPy（无需第三方） | **首选**：canonical 权重名 + 声明式配置 |
+| `.safetensors` + `config.json` | `safetensors`（numpy 独立加载） | 反序列化权重；结构由 `config.json` 重建 |
+| `.onnx` + `config.json` | `onnx.load` | 取 `graph.initializer` 作权重；配置由 `config.json` 重建 |
+| `.bin`（PyTorch 状态字典） | `torch.load` | 需 torch；权重为 dict 形式 |
+| `.bin`（原始 fp32） + `model.yaml` | 纯 NumPy | exporter 的原始二进制产物 |
+| `torch.nn.Module` | `torch.export.export()` | 需 torch；得到扁平 Export IR、状态字典、shape |
+
+所有 `external` 权重（`safetensors` / `onnx` / `bin`）经 `parser/normalize.py`
+归一化为统一 canonical 命名（剥离 `model.` 等前缀、映射 `embed_tokens→wte`、
+`norm→final_norm`、`GPT-2 的 h.N.ln_*/attn.c_attn` 等），配置由相邻 `config.json`
+经 `infer_config` 推导为 Parser 字段。无法映射的权重（如 `o_proj`、位置嵌入、`inv_freq`）
+自动忽略，不计入计算图。
 
 ### 2.1 首选路径：`torch.export`
 
@@ -196,6 +204,7 @@ def infer_shapes(g: GraphIR) -> None:
 ```
 llm2asic/parser/
 ├── loader.py        # load_model()：多来源统一加载
+├── normalize.py     # external 权重/配置 → canonical 命名与字段
 ├── parser.py        # 上游算子 → 内部算子；attention 模式匹配
 ├── shape.py         # Shape Engine (infer_shapes)
 ├── builder.py       # 组装 GraphIR / 拓扑排序 / 死代码剪枝 / 校验
