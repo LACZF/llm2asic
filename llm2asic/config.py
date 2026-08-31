@@ -25,6 +25,7 @@ class QuantConfig:
     activation_bit_width: int = 8
     threshold: float = 0.05     # 允许的最大数值退化
     sparse: bool = False
+    rsqrt_lut_bits: int = 20    # rsqrt 查找表项数 = 2^bits（默认 2^20，ASIC 综合可调小）
 
 
 @dataclass
@@ -40,12 +41,23 @@ class ArchConfig:
 
 
 @dataclass
+class SynthConfig:
+    """综合配置（PDK 无关，支持 FPGA 或任意 ASIC 标准单元库）。"""
+    backend: str = "fpga"          # "fpga" | "asic"
+    family: str = "xc7"            # FPGA family（仅 backend=fpga，synth_xilinx）
+    pdk: str = ""                  # PDK 名（仅 backend=asic，用于报告）
+    liberty: str = ""              # ASIC 标准单元 .lib 路径（backend=asic 必需）
+    clock_period_ns: float = 10.0  # 仅报告/后续 SDC，当前综合不使用时序约束
+
+
+@dataclass
 class CompileConfig:
     model_path: str
     out_dir: str = "build_out"
     backend: str = "verilog"
     quant: QuantConfig = field(default_factory=QuantConfig)
     arch: ArchConfig = field(default_factory=ArchConfig)
+    synth: SynthConfig = field(default_factory=SynthConfig)
     # Parser 相关
     input_seq_len: int = 8
     fp_dtype: str = "fp32"
@@ -87,6 +99,7 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
         activation_bit_width=int(quant_d.get("activation", {}).get("bit_width", 8)),
         threshold=float(quant_d.get("target_metric_deg", 0.05)),
         sparse=bool(quant_d.get("sparse", False)),
+        rsqrt_lut_bits=int(quant_d.get("rsqrt_lut_bits", 20)),
     )
     arch_d = raw.get("arch", {}) or {}
     arch = ArchConfig(
@@ -100,12 +113,21 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
         acc_width=int(arch_d.get("acc_width", 32)),
     )
     build_d = raw.get("build", {}) or {}
+    synth_d = raw.get("synth", {}) or {}
+    synth = SynthConfig(
+        backend=str(synth_d.get("backend", "fpga")),
+        family=str(synth_d.get("family", "xc7")),
+        pdk=str(synth_d.get("pdk", "")),
+        liberty=str(synth_d.get("liberty", "")),
+        clock_period_ns=float(synth_d.get("clock_period_ns", 10.0)),
+    )
     cfg = CompileConfig(
         model_path=model_path or str(build_d.get("model", "")),
         out_dir=out_dir or str(build_d.get("out_dir", "build_out")),
         backend=str(build_d.get("backend", "verilog")),
         quant=quant,
         arch=arch,
+        synth=synth,
         input_seq_len=int(build_d.get("input_seq_len", 8)),
         fp_dtype=str(build_d.get("fp_dtype", "fp32")),
         n_calib_tokens=int(build_d.get("n_calib_tokens", 8)),

@@ -180,11 +180,37 @@ report_utilization -file util_report.txt
 产出 `util_report.txt` 的资源使用，与 Architect 估算对比，用于 DSE 模型校准。
 
 ### 6.2 Yosys 流程（开源）
-生成 `synth.ys`，`read_verilog` + `synth_xilinx`（或 `synth_intel`），支持无商业工具环境下的
-综合验证与形式化检查。
+生成 `synth.ys`，支持两套后端（PDK/器件可配置）：
 
-### 6.3 ASIC（GDS）接入（远期）
-跨过 FPGA 综合，将 RTL 交给 ASIC 综合（如 `Design Compiler` / 开源 `OpenLane`），
+- **FPGA**（默认）：`read_verilog` + `synth_xilinx -family xc7 -flatten -nowidelut`，
+  产出 `netlist.v` 与 `util_report.txt`。乘法/权重 ROM 由 Xilinx DSP48 / RAMB 硬块吸收，
+  是本设计在开源工具下可完整跑通的综合路径（~20 min / ~9 GB 峰值）。
+- **ASIC 标准单元**（`synth.backend = asic`）：`read_liberty -lib <lib>` +
+  `memory -nomap` + `abc -liberty` + `dfflibmap`，映射到任意 PDK 的 `.lib`
+  （默认自动探测 OpenROAD-flow-scripts 下的 `sky130hd/sky130hs/nangate45/asap7/gf180` 等）。
+
+配置通过 `synth` 节（`backend`/`family`/`pdk`/`liberty`）或命令行
+`--backend/--pdk/--liberty` 指定；Makefile 暴露 `BACKEND`/`PDK`/`LIBERTY` 变量，例如：
+
+```sh
+make synth BACKEND=asic PDK=sky130hd LIBERTY=/path/.../sky130_fd_sc_hd__tt_025C_1v80.lib
+```
+
+#### ASIC 综合的容量约束（重要）
+受 11 GB 内存与开源 `abc` 能力的限制，`llama_tiny_accel`（乃至更小模型）的
+**ROM 供数宽乘加（gemv 24×24、attn 64×64）数据通路**无法在合理时间内用
+`abc -liberty` 映射成标准单元——该瓶颈与模型规模及 rsqrt 表大小无关（实测单个
+`gemv_0` 模块的 `abc` 映射即长时间停滞），因此完整设计的 sky130 门级网表
+当前无法在受限环境产出。FPGA 路径因硬块吸收这些资源而可行。
+`memory -nomap` 避免把内嵌 ROM 展开（否则单个 2^20 项 rsqrt 表 ≈ 100 万单元 → OOM）。
+
+### 6.3 rsqrt 查找表尺寸旋钮
+`gen_luts` 的 rsqrt 表默认 `2^20` 项（`QuantConfig.rsqrt_lut_bits = 20`，与历史一致，
+精度最高）。ASIC 演示可在配置 `quant.rsqrt_lut_bits` 中调小（如 10-12）以减小内存，
+RTL 与黄金参考始终共用同一张表、保持逐位一致，代价是 rmsnorm 精度变粗。
+
+### 6.4 ASIC（GDS）接入（远期）
+跨过 FPGA/标准单元综合，将 RTL 交给 ASIC 后端（如开源 `OpenLane` / `OpenROAD`），
 此路径在路线图 Phase 4（`top.md §9`）。
 
 ---

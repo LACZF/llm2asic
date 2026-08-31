@@ -1,0 +1,10 @@
+head_dim: 4
+hidden: 8
+max_seq_len: 4
+name: llama_mini
+norm_eps: 1.0e-05
+num_heads: 2
+num_layers: 1
+rope_theta: 10000.0
+tied_embedding: false
+vocab_size: 16

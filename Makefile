@@ -5,6 +5,8 @@
 #   make test       # 仅运行 pytest 测试套件
 #   make rtl        # 端到端：生成 RTL + 黄金参考 + 仿真逐位比对
 #   make synth      # Yosys 综合，产出最终门级网表 netlist.v（需 yosys）
+#                   #   BACKEND=fpga       -> synth_xilinx（默认）
+#                   #   BACKEND=asic PDK=sky130hd LIBERTY=xxx.lib -> 标准单元网表
 #   make clean      # 清理构建产物与缓存
 #
 # 说明：llm2asic 无需安装，Python 入口通过 PYTHONPATH=. 指向本仓库源码。
@@ -15,6 +17,11 @@ MODEL      ?= examples/llama_tiny/model.yaml
 OUT        ?= build_out
 IVLOG      := $(shell command -v iverilog 2>/dev/null)
 YOSYS      := $(shell command -v yosys 2>/dev/null)
+
+# 综合后端配置（PDK 可配置）
+BACKEND    ?= fpga
+PDK        ?= sky130hd
+LIBERTY    ?=
 
 .PHONY: all test rtl synth clean
 
@@ -36,9 +43,14 @@ test:
 synth: rtl
 	@if [ -z "$(YOSYS)" ]; then echo "ERROR: 未找到 yosys，请先安装"; exit 1; fi
 	@mkdir -p $(OUT)/synth
-	@echo "==> [yosys] 综合 $(OUT)/rtl -> $(OUT)/synth/netlist.v"
-	@cd $(OUT)/rtl && $(YOSYS) -s $(CURDIR)/scripts/synth.ys
-	@echo "==> [synth] 完成。网表: $(OUT)/synth/netlist.v  | 资源: $(OUT)/synth/util_report.txt"
+	@echo "==> [yosys] 综合 $(OUT)/rtl -> $(OUT)/synth/netlist.v (backend=$(BACKEND) pdk=$(PDK))"
+	@PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m llm2asic synth --model $(MODEL) \
+		--out $(OUT) --backend $(BACKEND) --pdk $(PDK) \
+		$(if $(LIBERTY),--liberty $(LIBERTY))
+	@echo "==> [synth] 完成。网表: $(OUT)/synth/netlist.v  | 日志: $(OUT)/synth/synth.log"
+	@if [ -f "$(OUT)/synth/util_report.txt" ]; then \
+		echo "==> [synth] 资源占用:"; grep -E "Number of cells|Chip area" $(OUT)/synth/synth.log | tail -6; \
+	fi
 
 clean:
 	rm -rf $(OUT)

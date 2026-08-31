@@ -1,0 +1,10 @@
+# ASIC（sky130 标准单元）综合演示配置。
+# 关键：把 rsqrt 查找表从 2^20 缩小到 2^10，使门级综合在受限内存(11GB)内可行。
+# RTL 与黄金参考始终共用同一张表，因此仍逐位一致；代价是 rmsnorm 精度变粗（演示用）。
+quant:
+  rsqrt_lut_bits: 10
+
+# ASIC 综合目标（也可在命令行 --backend/--pdk/--liberty 覆盖）
+synth:
+  backend: asic
+  pdk: sky130hd

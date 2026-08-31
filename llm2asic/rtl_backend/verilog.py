@@ -143,7 +143,7 @@ module rmsnorm #(parameter H=16, ACT=24, F=12)(
             logic signed [63:0] mean, idx;
             mean = (rsum + (H/2)) / H + 2;
             idx = (mean<1) ? 1 : (mean>RMX) ? RMX : mean;
-            c <= $signed(rsqrt_mem[idx[20:0]]);
+            c <= $signed(rsqrt_mem[idx[@@RSQRT_IDX@@:0]]);
           end
           ii<=0; st<=SELEM;
         end
@@ -740,7 +740,9 @@ endmodule
 def _fill_module(s: str, qmodel, **kw) -> str:
     for k, v in kw.items():
         s = s.replace("@@" + k + "@@", str(v))
+    rsqrt_idx = (qmodel.luts.rsqrt.shape[0] - 1).bit_length() - 1
     return (s.replace("@@RSQRT_MAX@@", str(qmodel.luts.rsqrt.shape[0] - 1))
+             .replace("@@RSQRT_IDX@@", str(rsqrt_idx))
              .replace("@@EXPMAX@@", str(qmodel.luts.exp_neg.shape[0] - 1))
              .replace("@@RECMAX@@", str(qmodel.luts.recip2.shape[0] - 1))
              .replace("@@RRFN@@", _RR_FN.strip()))

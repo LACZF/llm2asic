@@ -102,8 +102,16 @@ class LUTSet:
         }
 
 
-def gen_luts(act_bits: int = ACT_BITS, Fbits: int = F) -> LUTSet:
-    """确定性生成整套定点 LUT。"""
+def gen_luts(act_bits: int = ACT_BITS, Fbits: int = F, rsqrt_bits: int = 20) -> LUTSet:
+    """确定性生成整套定点 LUT。
+
+    Parameters
+    ----------
+    rsqrt_bits : int
+        rsqrt 查找表项数 = 2^rsqrt_bits。默认 20（2^20≈104 万项，精度最高）；
+        ASIC 综合为了方便在受限内存下展开，可调小（精度随之下探，
+        但 RTL 与黄金参考始终使用同一张表，保持逐位一致）。
+    """
     lut = LUTSet()
     SM = 2.0**Fbits
 
@@ -118,7 +126,8 @@ def gen_luts(act_bits: int = ACT_BITS, Fbits: int = F) -> LUTSet:
     lut.silu_input_bits = X
 
     # 2) rsqrt：x = 归一化后的整数（0..MAX），y = round(2^F * 1/sqrt(x))
-    MAX = 2**20
+    #    项数 = 2^rsqrt_bits + 1（索引 0..2^rsqrt_bits）；默认 2^20+1 与历史一致。
+    MAX = 1 << rsqrt_bits
     xv = np.arange(0, MAX + 1, dtype=np.float64)
     rsqrt = np.zeros(MAX + 1, dtype=np.int64)
     rsqrt[1:] = np.rint(SM / np.sqrt(xv[1:])).astype(np.int64)
