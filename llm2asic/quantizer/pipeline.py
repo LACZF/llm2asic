@@ -41,6 +41,7 @@ def run(llm_ir, quant_cfg, out_dir: str) -> QuantizedModel:
     model = QuantizedModel(
         engines=quant["engines"],
         wte_q=quant["wte_q"],
+        wpe_q=quant.get("wpe_q"),
         gammas=quant["gammas"],
         luts=quant["luts"],
         config=quant["config"],
@@ -64,18 +65,28 @@ def run(llm_ir, quant_cfg, out_dir: str) -> QuantizedModel:
         write_scale_rom(num, 24, os.path.join(romdir, sfile))
         qw.rom_file = wfile
         qw.scale_rom_file = sfile
+        if qw.bias_q is not None:                    # GPT-2 bias ROM
+            bfile = f"{key}_bias.mem"
+            write_lut_rom(np.asarray(qw.bias_q, np.int64).reshape(-1), 24,
+                          os.path.join(romdir, bfile))
+            qw.bias_rom_file = bfile
         metadata["weights"][key] = {
             "rom_file": wfile, "scale_rom_file": sfile,
             "rom_depth": len(words), "rom_width": word_bits,
             "bit_width": ww, "group_size": qw.group_size,
             "c_out": qw.c_out, "c_in": qw.c_in,
             "weight_source": qw.row_rename,
+            "bias_rom_file": qw.bias_rom_file or "",
         }
 
     # ---- 嵌入 ROM ----
     embfile = "wte_q.mem"
     write_embed_rom(model.wte_q, 24, os.path.join(romdir, embfile))
     metadata["weights"]["wte_q"] = {"rom_file": embfile, "bit_width": 24}
+    if model.wpe_q is not None:
+        wpefile = "wpe_q.mem"
+        write_embed_rom(model.wpe_q, 24, os.path.join(romdir, wpefile))
+        metadata["weights"]["wpe_q"] = {"rom_file": wpefile, "bit_width": 24}
 
     # ---- 归一化 gamma（定点常量 ROM）----
     for k, v in model.gammas.items():
@@ -89,7 +100,8 @@ def run(llm_ir, quant_cfg, out_dir: str) -> QuantizedModel:
     # ---- LUT ROM ----
     for fname, arr in model.luts.files.items():
         bits = { "rsqrt.mem": 24, "sigmoid.mem": 24,
-                 "silu.mem": 24, "exp_neg.mem": 24, "recip.mem": 24 }[fname]
+                 "silu.mem": 24, "gelu.mem": 24,
+                 "exp_neg.mem": 24, "recip.mem": 24 }[fname]
         write_lut_rom(arr, bits, os.path.join(romdir, fname))
         metadata["luts"][fname] = {"bit_width": bits, "depth": int(len(arr))}
 

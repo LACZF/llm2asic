@@ -1,0 +1,11 @@
+{
+  "model_type": "gpt2",
+  "_name_or_path": "gpt2_tiny",
+  "n_embd": 8,
+  "n_head": 2,
+  "n_layer": 1,
+  "n_positions": 4,
+  "vocab_size": 16,
+  "n_inner": 16,
+  "layer_norm_eps": 1e-05
+}

@@ -48,6 +48,8 @@ class IntModel:
         self.vocab = config["vocab_size"]
         self.scale = 1.0 / (self.head_dim ** 0.5)
         self.max_seq = config["max_seq_len"]
+        self.arch = str(config.get("architecture", "llama")).lower()
+        self.n_inner = int(config.get("n_inner", 4 * self.hidden))
         self.kv = {}
         # softmax 分数量化：score_e = rint(dot * scale * 2^(EF-2F))
         # scale 为 2 的幂时用精确移位；否则记录为 None（v1 仅支持 2 的幂）。
@@ -62,11 +64,18 @@ class IntModel:
     def embed(self, token: int) -> np.ndarray:
         return clamp_act(self.qw["wte_q"][token])
 
+    def embed_gpt2(self, token: int, pos: int) -> np.ndarray:
+        return clamp_act(self.qw["wte_q"][token]
+                         + self.qw["wpe_q"][pos])
+
     def linear(self, x_q, qw: QWeight) -> np.ndarray:
-        # out.q[o] = rshift_round( Σ_j wq[o,j]*x.q[j] * num[o], REQUANT_S )
+        # out.q[o] = rshift_round( Σ_j wq[o,j]*x.q[j] * num[o], REQUANT_S ) (+ bias)
         acc = qw.wq.astype(np.int64) @ x_q.astype(np.int64)   # [C_out]
         num = qw.scale_num.astype(np.int64)
-        return clamp_act(rshift_round(acc * num, REQUANT_S))
+        out = rshift_round(acc * num, REQUANT_S)
+        if getattr(qw, "bias_q", None) is not None:
+            out = out + np.asarray(qw.bias_q, dtype=np.int64)
+        return clamp_act(out)
 
     def rmsnorm(self, x_q, gamma_q: np.ndarray) -> np.ndarray:
         # out.q = rshift_round( x.q * gamma_q * c, F )，c = rsqrt_lut[mean2]
@@ -78,6 +87,34 @@ class IntModel:
         c = int(self.luts.rsqrt[idx])
         gq = gamma_q.astype(np.int64)
         return clamp_act(rshift_round(x64 * gq * c, F))
+
+    def layernorm(self, x_q, gamma_q: np.ndarray, beta_q: np.ndarray) -> np.ndarray:
+        """LayerNorm（GPT-2）：(x - mean) * rsqrt(1 + var) * gamma + beta。
+
+        与 reference.rmsnorm 同一套定点：mean2 = (Σ x²)/n + 1（+1 近似 LayerNorm
+        的 var+eps 中把 eps 折叠进 rsqrt 前加 1）。这里 GPT-2 用中心化均值，
+        先减均值再取平方和。
+        """
+        n = x_q.shape[0]
+        x64 = x_q.astype(np.int64)
+        mean = (int(np.sum(x64)) + n // 2) // max(1, n)
+        xc = x64 - mean
+        sum2c = int(np.sum(xc * xc))
+        # var+eps 的倒数索引：mean2 = Σxc²/n + 1
+        mean2 = (sum2c + n // 2) // max(1, n) + 1
+        idx = int(np.clip(mean2, 1, self.luts.rsqrt.shape[0] - 1))
+        c = int(self.luts.rsqrt[idx])
+        gq = gamma_q.astype(np.int64)
+        bq = beta_q.astype(np.int64)
+        v = rshift_round(xc * gq * c, F) + bq
+        return clamp_act(v)
+
+    def gelu(self, x_q) -> np.ndarray:
+        lut = self.luts.gelu
+        xb = self.luts.gelu_input_bits
+        lo, hi = -2 ** (xb - 1), 2 ** (xb - 1) - 1
+        xi = np.clip(x_q, lo, hi).astype(np.int64) - lo
+        return clamp_act(lut[xi].astype(np.int64))
 
     def silu(self, x_q) -> np.ndarray:
         lut = self.luts.silu_gate
@@ -143,6 +180,41 @@ class IntModel:
     # 解码一步
     # ------------------------------------------------------------------
     def run_decode_step(self, token: int, pos: int) -> np.ndarray:
+        if self.arch == "gpt2":
+            return self.run_decode_step_gpt2(token, pos)
+        return self.run_decode_step_llama(token, pos)
+
+    def run_decode_step_gpt2(self, token: int, pos: int) -> np.ndarray:
+        h = self.embed_gpt2(token, pos)
+        hidden = self.hidden
+        for L in range(self.layers):
+            n1 = self.layernorm(h, self.qw[f"layers.{L}.ln_1.gamma"],
+                                self.qw[f"layers.{L}.ln_1.beta"])
+            q = self.linear(n1, self.qw[f"layers.{L}.q"])
+            k = self.linear(n1, self.qw[f"layers.{L}.k"])
+            v = self.linear(n1, self.qw[f"layers.{L}.v"])
+            kv = self.kv.get(L, (np.zeros((0, hidden), np.int64),
+                                 np.zeros((0, hidden), np.int64)))
+            kk, vv = kv
+            kk = np.vstack([kk, k.reshape(1, -1)])
+            vv = np.vstack([vv, v.reshape(1, -1)])
+            self.kv[L] = (kk, vv)
+            qm = q.reshape(self.heads, self.head_dim)
+            km = kk.reshape(-1, self.heads, self.head_dim).transpose(1, 0, 2)
+            vm = vv.reshape(-1, self.heads, self.head_dim).transpose(1, 0, 2)
+            att = self.attention(qm, km, vm)
+            o = self.linear(att, self.qw[f"layers.{L}.o"])
+            h1 = self.add(h, o)
+            n2 = self.layernorm(h1, self.qw[f"layers.{L}.ln_2.gamma"],
+                                self.qw[f"layers.{L}.ln_2.beta"])
+            fc = self.linear(n2, self.qw[f"layers.{L}.fc"])
+            act = self.gelu(fc)
+            proj = self.linear(act, self.qw[f"layers.{L}.proj"])
+            h = self.add(h1, proj)
+        nf = self.layernorm(h, self.qw["final_norm.gamma"], self.qw["final_norm.beta"])
+        return self.linear(nf, self.qw["output_proj"])
+
+    def run_decode_step_llama(self, token: int, pos: int) -> np.ndarray:
         h = self.embed(token)
         hidden = self.hidden
         for L in range(self.layers):

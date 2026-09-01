@@ -63,6 +63,8 @@ def _build_gold(qm, tokens: np.ndarray, out_dir: str) -> np.ndarray:
     """
     qw = dict(qm.engines)
     qw["wte_q"] = qm.wte_q
+    if qm.wpe_q is not None:
+        qw["wpe_q"] = qm.wpe_q
     for k, v in qm.gammas.items():
         qw[k] = v
     m = IntModel(qw, qm.luts, qm.config)
@@ -142,9 +144,11 @@ def run(model_path: str,
         if cfg.enable_sim:
             gemv_files = sorted(fn for fn in os.listdir(rdir)
                                 if fn.startswith("gemv_") and fn.endswith(".sv"))
+            norm_file = ("layernorm.sv" if qm.config.get("architecture") == "gpt2"
+                         else "rmsnorm.sv")
             _run_tool(["iverilog", "-g2012", "-o", "sim.vvp",
                        f"{modname}.sv", *gemv_files,
-                       "rmsnorm.sv", "attn.sv", "sim_tb.sv"],
+                       norm_file, "attn.sv", "sim_tb.sv"],
                       rdir, what="iverilog 编译")
             proc = subprocess.run(["vvp", "sim.vvp"], cwd=rdir,
                                   capture_output=True, text=True)

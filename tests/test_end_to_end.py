@@ -20,7 +20,10 @@ from llm2asic.rtl_backend.reference import IntModel
 
 MODEL = os.path.join(os.path.dirname(__file__), "..", "examples",
                      "llama_tiny", "model.yaml")
+GPT2_MODEL = os.path.join(os.path.dirname(__file__), "..", "examples",
+                          "gpt2_tiny", "model.yaml")
 TOKENS = np.array([3, 7, 1, 15, 0, 5, 9, 2], dtype=np.int64)
+GPT2_TOKENS = np.array([7, 10, 13, 0], dtype=np.int64)
 
 
 def _have_iverilog() -> bool:
@@ -102,6 +105,75 @@ def test_generated_rtl_compiles(qmodel):
            os.path.join(rdir, f"{mod}.sv"),
            *[os.path.join(rdir, fn) for fn in gemv_files],
            os.path.join(rdir, "rmsnorm.sv"),
+           os.path.join(rdir, "attn.sv"),
+           os.path.join(rdir, "sim_tb.sv")]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, f"iverilog 失败:\n{proc.stdout}\n{proc.stderr}"
+
+
+# --------------------------------------------------------------------------
+# GPT-2：LayerNorm（减均值 + gamma/beta）与 GELU 的逐位一致回归。
+# 覆盖 llm2asic/rtl_backend/verilog.py 中 mean 的 floor 除法（负均值时
+# Verilog 截断除 vs Python // 地板除相差 1）修复。
+# --------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def qmodel_gpt2(tmp_path_factory):
+    mpath = os.path.abspath(GPT2_MODEL)
+    out = tmp_path_factory.mktemp("beam_gpt2")
+    cfg = CompileConfig(model_path=mpath, out_dir=str(out))
+    ir = run_from_path(mpath)
+    qm = quantizer_run(ir, cfg, str(out))
+    return mpath, cfg, qm, str(out)
+
+
+def _gold_gpt2(qm, tokens):
+    qw = dict(qm.engines)
+    qw["wte_q"] = qm.wte_q
+    qw["wpe_q"] = qm.wpe_q
+    for k, v in qm.gammas.items():
+        qw[k] = v
+    m = IntModel(qw, qm.luts, qm.config)
+    return np.array([m.run_decode_step_gpt2(int(tokens[i]), i)
+                     for i in range(len(tokens))], dtype=np.int64)
+
+
+def test_reference_gpt2_gold_and_kv_accumulation(qmodel_gpt2):
+    _, _, qm, _ = qmodel_gpt2
+    g = _gold_gpt2(qm, GPT2_TOKENS)
+    assert g.shape == (qm.config["max_seq_len"], qm.config["vocab_size"])
+    assert not np.array_equal(g[0], g[1])
+
+
+@pytest.mark.skipif(not _have_iverilog(),
+                    reason="需要 Icarus Verilog（iverilog/vvp）")
+def test_gpt2_rtl_sim_bit_exact(qmodel_gpt2):
+    """关键回归：LayerNorm 负均值 floor 除法，RTL 仿真必须逐位对齐参考。"""
+    mpath, cfg, qm, out = qmodel_gpt2
+    toks = GPT2_TOKENS[: qm.config["max_seq_len"]]
+    res = backend_run(mpath, cfg, tokens=toks)
+
+    assert res.errors == []
+    assert res.sim_ran
+    assert res.bit_exact, \
+        f"gpt2 logits 未逐位一致: {res.logits_match}/{res.logits_total} " \
+        f"worst={res.worst_abs_err}"
+
+
+@pytest.mark.skipif(not shutil.which("iverilog"),
+                    reason="需要 Icarus Verilog 进行编译验证")
+def test_gpt2_generated_rtl_compiles(qmodel_gpt2):
+    mpath, cfg, qm, out = qmodel_gpt2
+    toks = GPT2_TOKENS[: qm.config["max_seq_len"]]
+    backend_run(mpath, cfg, tokens=toks)
+    rdir = os.path.join(out, "rtl")
+    mod = f"{qm.config['name']}_accel"
+    gemv_files = sorted(fn for fn in os.listdir(rdir)
+                        if fn.startswith("gemv_") and fn.endswith(".sv"))
+    cmd = ["iverilog", "-g2012", "-o", "/dev/null",
+           os.path.join(rdir, f"{mod}.sv"),
+           *[os.path.join(rdir, fn) for fn in gemv_files],
+           os.path.join(rdir, "layernorm.sv"),
            os.path.join(rdir, "attn.sv"),
            os.path.join(rdir, "sim_tb.sv")]
     proc = subprocess.run(cmd, capture_output=True, text=True)

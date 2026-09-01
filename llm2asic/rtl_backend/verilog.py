@@ -101,6 +101,66 @@ module @@GMOD@@ #(
 endmodule
 '''
 
+GEMV_TEMPLATE_BIAS = r'''
+// gemv + bias（GPT-2）：yout[o] = clamp( rr(acc*num, RS) + bias_rom[o] )。
+module @@GMOD@@ #(
+  parameter C_IN=16, parameter C_OUT=16, parameter SIMD=8, parameter WW=4,
+  parameter ACT=24, parameter RS=16, parameter WORDS=32, parameter NUM_BITS=24
+)(
+  input logic clk, input logic rst_n, input logic en,
+  input logic signed [C_IN*ACT-1:0] x,
+  output logic signed [C_OUT*ACT-1:0] yout,
+  output logic done
+);
+@@RRFN@@
+  localparam WPR = (C_IN + SIMD - 1) / SIMD;
+  logic [WW*SIMD-1:0] wrom [0:WORDS-1];
+  logic [NUM_BITS-1:0] nrom [0:C_OUT-1];
+  logic signed [23:0] brom [0:C_OUT-1];
+  initial begin $readmemh("@@WF@@", wrom); $readmemh("@@SF@@", nrom);
+                  $readmemh("@@BF@@", brom); end
+
+  function automatic logic signed [63:0] chunk_mac(input int oo, input int cc);
+    integer j; logic signed [31:0] w; logic signed [63:0] p;
+    p = 0;
+    for (j=0;j<SIMD;j=j+1) begin
+      w = $signed({ {32-WW{ wrom[oo*WPR+cc][j*WW+WW-1] }}, wrom[oo*WPR+cc][j*WW +: WW] });
+      p = p + w * $signed(x[(cc*SIMD+j)*ACT +: ACT]);
+    end
+    chunk_mac = p;
+  endfunction
+
+  localparam S_IDLE=0, S_MAC=1, S_REQ=2;
+  reg [3:0] st;
+  reg signed [63:0] acc;
+  reg [15:0] o, ch;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin st<=S_IDLE; done<=0; yout<='0; end
+    else begin
+      done<=0;
+      case (st)
+        S_IDLE: if (en) begin st<=S_MAC; o<=0; ch<=0; acc<=0; end
+        S_MAC: begin
+          acc<=acc+chunk_mac(o,ch);
+          if (ch==WPR-1) st<=S_REQ; else ch<=ch+1;
+        end
+        S_REQ: begin
+          begin : bb
+            logic signed [63:0] bv;
+            bv = rr(acc*$signed({ {64-NUM_BITS{1'b0}}, nrom[o]}), RS)
+                 + $signed(brom[o]);
+            bv = (bv>64'sd8388607)?64'sd8388607:((bv<-64'sd8388608)?-64'sd8388608:bv);
+            yout[o*ACT +: ACT] <= bv[ACT-1:0];
+          end
+          if (o==C_OUT-1) begin st<=S_IDLE; done<=1; end
+          else begin o<=o+1; ch<=0; acc<=0; st<=S_MAC; end
+        end
+      endcase
+    end
+  end
+endmodule
+'''
+
 RMSNORM_TEMPLATE = r'''
 // rmsnorm：规约 + rsqrt LUT + 逐元素定点乘。x/g 打包，yout 打包。
 module rmsnorm #(parameter H=16, ACT=24, F=12)(
@@ -161,8 +221,84 @@ module rmsnorm #(parameter H=16, ACT=24, F=12)(
 endmodule
 '''
 
-ATTN_TEMPLATE = r'''
-// 单 token 多头注意力：定点 softmax（exp LUT + recip LUT）。qr/kvk/kvv 打包。
+LAYERNORM_TEMPLATE = r'''
+// layernorm（GPT-2）：(x-mean)*rsqrt(1+Σ(x-mean)^2/H)*gamma + beta。x/g/b 打包。
+module layernorm #(parameter H=16, ACT=24, F=12)(
+  input logic clk, input logic rst_n, input logic en,
+  input logic signed [H*ACT-1:0] x, g, b,
+  output logic signed [H*ACT-1:0] yout,
+  output logic done
+);
+@@RRFN@@
+  logic signed [ACT-1:0] xa[H], ga[H], ba[H];
+  always_comb begin
+    for (int i=0;i<H;i=i+1) begin
+      xa[i]=$signed(x[i*ACT +: ACT]);
+      ga[i]=$signed(g[i*ACT +: ACT]);
+      ba[i]=$signed(b[i*ACT +: ACT]);
+    end
+  end
+  localparam RMX=@@RSQRT_MAX@@;
+  logic signed [23:0] rsqrt_mem [0:RMX];
+  initial $readmemh("rsqrt.mem", rsqrt_mem);
+
+  logic signed [63:0] rsum, rsumc, meanv;
+  logic signed [23:0] c;
+  logic signed [ACT-1:0] xc[0:H-1];
+  logic [15:0] ii;
+  reg [2:0] st;
+  localparam S0=0, SSUM=1, SMEAN=2, SELEM=3;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin st<=S0; done<=0; end
+    else begin
+      done<=0;
+      case(st)
+        S0: if(en) begin st<=SSUM; rsum<=0; ii<=0; end
+        SSUM: begin
+          rsum<=rsum + $signed(xa[ii]);
+          xc[ii]<=xa[ii];
+          if(ii==H-1) begin
+            begin : mn
+              logic signed [63:0] nsum;
+              nsum = rsum + $signed(xa[ii]) + (H/2);
+              meanv <= (nsum>=0) ? (nsum / H) : ((nsum - (H - 1)) / H);
+            end
+            st<=SMEAN;
+          end else ii<=ii+1;
+        end
+        SMEAN: begin
+          begin : mc
+            logic signed [63:0] s2, idx;
+            s2=0;
+            for (int j=0;j<H;j=j+1) begin
+              xc[j]<=$signed(xa[j])-meanv;
+              s2=s2 + ($signed(xa[j])-meanv)*($signed(xa[j])-meanv);
+            end
+            idx = (s2 + (H/2)) / H + 1;
+            idx = (idx<1) ? 1 : ((idx>RMX) ? RMX : idx);
+            c <= $signed(rsqrt_mem[idx[@@RSQRT_IDX@@:0]]);
+          end
+          ii<=0; st<=SELEM;
+        end
+        SELEM: begin
+          begin : sv
+            logic signed [63:0] v;
+            v = $signed(xc[ii])*$signed(ga[ii])*$signed(c);
+            v = (v>=0) ? ((v + (1 <<< (F-1))) >>> F)
+                       : -( ( (-v) + (1 <<< (F-1)) ) >>> F );
+            v = v + $signed(ba[ii]);
+            v = (v>64'sd8388607)?64'sd8388607:((v<-64'sd8388608)?-64'sd8388608:v);
+            yout[ii*ACT +: ACT] <= v[ACT-1:0];
+          end
+          if(ii==H-1) begin st<=S0; done<=1; end else ii<=ii+1;
+        end
+      endcase
+    end
+  end
+endmodule
+'''
+
+ATTN_TEMPLATE = r'''// 单 token 多头注意力：定点 softmax（exp LUT + recip LUT）。qr/kvk/kvv 打包。
 module attn #(parameter H=16, HEADS=4, HD=4, SEQ=8, ACT=24, F=12, EF=10, RR=24, K=15)(
   input logic clk, input logic rst_n, input logic en,
   input logic signed [H*ACT-1:0] qr,
@@ -685,8 +821,364 @@ def _emit_top(qmodel, cfg: dict) -> str:
     return r
 
 
+# --------------------------------------------------------------------------
+# GPT-2 RTL（LayerNorm + GELU + 绝对位置嵌入，无 RoPE；linear 带 bias）
+# --------------------------------------------------------------------------
+
+def _build_master_gpt2(engine_list, cfg):
+    """GPT-2 master FSM。engine_list: [(key,QWeight)]。"""
+    LYR = cfg["num_layers"]
+    eid_of = {k: i for i, (k, _) in enumerate(engine_list)}
+    idx_of = lambda eng: eid_of[f"layers.{eng}"]
+
+    names = ["S_IDLE", "S_DEC", "RMSF", "RMSFW", "OUT", "OUTW", "LOGW", "ADVT", "DONE"]
+    for L in range(LYR):
+        names += [f"R0{L}", f"R0{L}W",
+                  f"q{L}", f"q{L}W", f"k{L}", f"k{L}W", f"v{L}", f"v{L}W",
+                  f"KV{L}", f"AT{L}", f"AT{L}W",
+                  f"o{L}", f"o{L}W", f"AH{L}",
+                  f"R1{L}", f"R1{L}W",
+                  f"fc{L}", f"fc{L}W", f"GE{L}",
+                  f"pr{L}", f"pr{L}W", f"AHH{L}"]
+    sn = {n: i for i, n in enumerate(names)}
+    state_defs = "\n".join(f"  localparam {n}={i};" for i, n in enumerate(names))
+
+    def nxt_after_layer(L):
+        return f"R0{L+1}" if L + 1 < LYR else "RMSF"
+
+    C = []
+    def emit(st, body):
+        C.append(f"        {sn[st]}: begin {body} end")
+
+    kv_reset = "; ".join(
+        f"for(int pi=0;pi<H;pi=pi+1) for(int qi=0;qi<SEQ;qi=qi+1) "
+        f"begin kv_k[{L}][qi][pi]<='0; kv_v[{L}][qi][pi]<='0; end"
+        for L in range(LYR))
+    emit("S_IDLE", f"if(start) begin tokk<=0; {kv_reset}; S<={sn['S_DEC']}; end "
+                   f"else S<={sn['S_IDLE']};")
+    # 位置嵌入：h[i] = embed_rom[token] + wpe_rom[tokk*H+i]
+    emit("S_DEC",
+         f"for(int i=0;i<H;i=i+1) h[i]<="
+         f"$signed(embed_rom[token_ram[tokk]*H+i])+$signed(wpe_rom[tokk*H+i]); "
+         f"S<={sn['R00']};")
+
+    def gemv_en_wait(st_en, idx, st_done_next):
+        st_w = st_en + "W"
+        emit(st_en, f"gen_{idx}<=1; S<={sn[st_w]};")
+        emit(st_w, f"gen_{idx}<=0; if(gd_{idx}) S<={sn[st_done_next]}; "
+                   f"else S<={sn[st_w]};")
+
+    def ln_en_wait(st_en, gsel, bsel, xsel, st_done_next, target):
+        st_w = st_en + "W"
+        emit(st_en, f"ln_en<=1; ln_gsel<={gsel}; ln_bsel<={bsel}; "
+                    f"ln_xsel<={xsel}; S<={sn[st_w]};")
+        emit(st_w, f"ln_en<=0; if(ln_done) begin "
+                   f"for(int i=0;i<H;i=i+1) {target}[i]<="
+                   f"$signed(ln_yout[i*24 +: 24]); S<={sn[st_done_next]}; "
+                   f"end else S<={sn[st_w]};")
+
+    for L in range(LYR):
+        # ln_1: gsel=4L, bsel=4L+1（norm 数组排序：每层 ln_1.g/b, ln_2.g/b）
+        ln_en_wait(f"R0{L}", 4 * L, 4 * L + 1, 0, f"q{L}", "n1")
+        gemv_en_wait(f"q{L}", idx_of(f"{L}.q"), f"k{L}")
+        gemv_en_wait(f"k{L}", idx_of(f"{L}.k"), f"v{L}")
+        gemv_en_wait(f"v{L}", idx_of(f"{L}.v"), f"KV{L}")
+        emit(f"KV{L}", (f"for(int i=0;i<H;i=i+1) begin "
+                        f"kv_k[{L}][tokk][i]<=kvec[i]; kv_v[{L}][tokk][i]<=vvec[i]; "
+                        f"end S<={sn[f'AT{L}']};"))
+        emit(f"AT{L}", f"att_en<=1; att_layer<={L}; att_seq<=tokk+1; "
+                       f"S<={sn[f'AT{L}W']};")
+        emit(f"AT{L}W", f"att_en<=0; if(att_done) begin "
+                        f"for(int i=0;i<H;i=i+1) att[i]<="
+                        f"$signed(att_yout[i*24 +: 24]); S<={sn[f'o{L}']}; "
+                        f"end else S<={sn[f'AT{L}W']};")
+        gemv_en_wait(f"o{L}", idx_of(f"{L}.o"), f"AH{L}")
+        emit(f"AH{L}", (f"for(int i=0;i<H;i=i+1) begin "
+                        f"logic signed [63:0] sa, sc; "
+                        f"sa=$signed(h[i])+$signed(ovec[i]); "
+                        f"sc=(sa>64'sd8388607)?64'sd8388607:"
+                        f"((sa<-64'sd8388608)?-64'sd8388608:sa); "
+                        f"h1[i]<=sc[ACT-1:0]; end S<={sn[f'R1{L}']};"))
+        ln_en_wait(f"R1{L}", 4 * L + 2, 4 * L + 3, 1, f"fc{L}", "n2")
+        gemv_en_wait(f"fc{L}", idx_of(f"{L}.fc"), f"GE{L}")
+        # GELU（组合，1 拍）：fcvec -> gvec
+        emit(f"GE{L}", (f"for(int i=0;i<NINNER;i=i+1) begin "
+                        f"logic signed [63:0] xi; integer sidx; "
+                        f"xi=$signed(fcvec[i]); "
+                        f"xi=(xi<GELU_LO)?GELU_LO:((xi>GELU_HI)?GELU_HI:xi); "
+                        f"sidx=xi-GELU_LO; gvec[i]<=gelu_mem[sidx]; "
+                        f"end S<={sn[f'pr{L}']};"))
+        gemv_en_wait(f"pr{L}", idx_of(f"{L}.proj"), f"AHH{L}")
+        nl = nxt_after_layer(L)
+        emit(f"AHH{L}", (f"for(int i=0;i<H;i=i+1) begin "
+                         f"logic signed [63:0] sa, sc; "
+                         f"sa=$signed(h1[i])+$signed(pvec[i]); "
+                         f"sc=(sa>64'sd8388607)?64'sd8388607:"
+                         f"((sa<-64'sd8388608)?-64'sd8388608:sa); "
+                         f"h[i]<=sc[ACT-1:0]; end S<={sn[nl]};"))
+
+    # final norm（gsel=4*LYR, bsel=4*LYR+1）
+    ln_en_wait("RMSF", 4 * LYR, 4 * LYR + 1, 0, "OUT", "nf")
+    out_idx = eid_of["output_proj"]
+    gemv_en_wait("OUT", out_idx, "LOGW")
+    emit("LOGW", f"for(int vi=0;vi<VOCAB;vi=vi+1) logit_bank[tokk][vi]<=outvec[vi]; "
+                 f"S<={sn['ADVT']};")
+    emit("ADVT", f"if(tokk==SEQ-1) S<={sn['DONE']}; else begin tokk<=tokk+1; "
+                 f"S<={sn['S_DEC']}; end")
+    emit("DONE", f"done<=1; S<={sn['S_IDLE']};")
+
+    return state_defs, "\n".join(C)
+
+
+_TOP_TEMPLATE_GPT2 = r'''
+`timescale 1ns/1ps
+// =====================================================================
+// @@MODNAME@@ : GPT-2 预填充（prefill）整数推理加速器
+// LayerNorm + GELU + 绝对位置嵌入（无 RoPE）；linear 带 bias。
+// 与 llm2asic.rtl_backend.reference.IntModel.run_decode_step_gpt2 逐位一致。
+// =====================================================================
+module @@MODNAME@@ #(
+  parameter H=@@H@@, parameter HEADS=@@HEADS@@, parameter HD=@@HD@@,
+  parameter LYR=@@LYR@@, parameter SEQ=@@SEQ@@, parameter VOCAB=@@VOCAB@@,
+  parameter NINNER=@@NINNER@@,
+  parameter F=@@F@@, parameter RS=@@RS@@, parameter RR=@@RR@@, parameter ACT=@@ACT@@
+)(
+  input logic clk, input logic rst_n, input logic start,
+  input logic [SEQ*16-1:0] token_flat,
+  output logic done,
+  output logic signed [SEQ*VOCAB*28-1:0] logit_flat
+);
+  // ---------- 端口解包 ----------
+  logic [15:0] token_ram [0:SEQ-1];
+  logic signed [27:0] logit_bank [0:SEQ-1][0:VOCAB-1];
+  genvar gt_f, gv_f, gi_f;
+  generate
+    for (gi_f=0; gi_f<SEQ; gi_f=gi_f+1) begin : gtok
+      assign token_ram[gi_f] = token_flat[gi_f*16 +: 16];
+    end
+    for (gt_f=0; gt_f<SEQ; gt_f=gt_f+1) begin : glog_t
+      for (gv_f=0; gv_f<VOCAB; gv_f=gv_f+1) begin : glog_v
+        assign logit_flat[(gt_f*VOCAB+gv_f)*28 +: 28] = logit_bank[gt_f][gv_f];
+      end
+    end
+  endgenerate
+
+  // ---------- 激活向量 ----------
+  logic signed [ACT-1:0] h   [0:H-1];
+  logic signed [ACT-1:0] n1  [0:H-1];
+  logic signed [ACT-1:0] n2  [0:H-1];
+  logic signed [ACT-1:0] nf  [0:H-1];
+  logic signed [ACT-1:0] qvec[0:H-1];
+  logic signed [ACT-1:0] kvec[0:H-1];
+  logic signed [ACT-1:0] vvec[0:H-1];
+  logic signed [ACT-1:0] att [0:H-1];
+  logic signed [ACT-1:0] ovec[0:H-1];
+  logic signed [ACT-1:0] fcvec[0:NINNER-1];
+  logic signed [ACT-1:0] gvec[0:NINNER-1];
+  logic signed [ACT-1:0] pvec[0:H-1];
+  logic signed [ACT-1:0] outvec[0:VOCAB-1];
+  logic signed [ACT-1:0] h1  [0:H-1];
+
+  // ---------- KV 缓存 ----------
+  logic signed [ACT-1:0] kv_k [0:LYR-1][0:SEQ-1][0:H-1];
+  logic signed [ACT-1:0] kv_v [0:LYR-1][0:SEQ-1][0:H-1];
+  reg [15:0] tokk;
+
+  // ---------- 嵌入 + 位置嵌入 ROM ----------
+  logic signed [23:0] embed_rom [0:VOCAB*H-1];
+  initial $readmemh("wte_q.mem", embed_rom);
+  logic signed [23:0] wpe_rom [0:SEQ*H-1];
+  initial $readmemh("wpe_q.mem", wpe_rom);
+
+  // ---------- 归一化（gamma/beta）ROM ----------
+@@NORM_ROMS@@
+
+  // ---------- gelu LUT ----------
+  localparam GELU_LO=@@GELU_LO@@;
+  localparam GELU_HI=@@GELU_HI@@;
+  logic signed [23:0] gelu_mem [0:@@GELU_SPAN@@];
+  initial $readmemh("gelu.mem", gelu_mem);
+
+  // ---------- gemv 实例 ----------
+@@GEMV_DECLS@@
+@@GEMV_INSTS@@
+@@GEMV_DRIVES@@
+@@GEMV_LATCH@@
+
+  // ---------- layernorm 实例 ----------
+  logic ln_en, ln_done;
+  logic [5:0] ln_gsel, ln_bsel;
+  logic ln_xsel;
+  logic signed [H*ACT-1:0] ln_xin, ln_gin, ln_bin, ln_yout;
+  layernorm #(.H(H),.ACT(ACT),.F(F)) u_ln (
+    .clk(clk),.rst_n(rst_n),.en(ln_en),.x(ln_xin),.g(ln_gin),.b(ln_bin),
+    .yout(ln_yout),.done(ln_done));
+  always_comb begin
+    for (int i=0;i<H;i=i+1)
+      case (ln_xsel)
+        1: ln_xin[i*ACT +: ACT] = h1[i];
+        default: ln_xin[i*ACT +: ACT] = h[i];
+      endcase
+    case (ln_gsel)
+@@LN_GSEL@@
+      default: ln_gin = '0;
+    endcase
+    case (ln_bsel)
+@@LN_BSEL@@
+      default: ln_bin = '0;
+    endcase
+  end
+
+  // ---------- attn 实例 ----------
+  logic att_en, att_done;
+  logic [15:0] att_seq;
+  logic [7:0] att_layer;
+  logic signed [H*ACT-1:0] att_qr;
+  logic signed [SEQ*H*ACT-1:0] att_kvk, att_kvv;
+  logic signed [H*ACT-1:0] att_yout;
+  attn #(.H(H),.HEADS(HEADS),.HD(HD),.SEQ(SEQ),.ACT(ACT),.F(F),.EF(10),.RR(RR),.K(15))
+    u_att (.clk(clk),.rst_n(rst_n),.en(att_en),.qr(att_qr),.kvk(att_kvk),
+           .kvv(att_kvv),.seq(att_seq),.yout(att_yout),.done(att_done));
+  always_comb begin
+    for (int i=0;i<H;i=i+1) att_qr[i*ACT +: ACT] = qvec[i];
+    for (int p=0;p<SEQ;p=p+1)
+      for (int i=0;i<H;i=i+1) begin
+        att_kvk[(p*H+i)*ACT +: ACT] = kv_k[att_layer][p][i];
+        att_kvv[(p*H+i)*ACT +: ACT] = kv_v[att_layer][p][i];
+      end
+  end
+
+  // ---------- master FSM ----------
+  reg [7:0] S;
+@@STATE_DEFS@@
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      S<=S_IDLE; done<=0; tokk<=0; ln_en<=0; ln_xsel<=0; att_en<=0; att_layer<=0;
+    end else begin
+      done<=0; ln_en<=0; att_en<=0;
+      case (S)
+@@MASTER_CASE@@
+      endcase
+    end
+  end
+
+endmodule
+'''
+
+
+def _emit_top_gpt2(qmodel, cfg: dict) -> str:
+    H = cfg["hidden"]; HEADS = cfg["num_heads"]; HD = cfg["head_dim"]
+    LYR = cfg["num_layers"]; SEQ = cfg["max_seq_len"]; VOCAB = cfg["vocab_size"]
+    simd = qmodel.simd; ww = qmodel.bit_width
+
+    engine_list = sorted(qmodel.engines.items())
+    eid_of = {k: i for i, (k, _) in enumerate(engine_list)}
+
+    target_of = {}
+    inp_of = {}
+    for L in range(LYR):
+        for nm in ["q", "k", "v"]:
+            target_of[f'layers.{L}.{nm}'] = nm + "vec"
+            inp_of[f'layers.{L}.{nm}'] = 'n1'
+        target_of[f'layers.{L}.o'] = 'ovec'
+        inp_of[f'layers.{L}.o'] = 'att'
+        target_of[f'layers.{L}.fc'] = 'fcvec'
+        inp_of[f'layers.{L}.fc'] = 'n2'
+        target_of[f'layers.{L}.proj'] = 'pvec'
+        inp_of[f'layers.{L}.proj'] = 'gvec'
+    target_of['output_proj'] = 'outvec'
+    inp_of['output_proj'] = 'nf'
+
+    gemv_insts, gemv_drives, gemv_latch, gemv_decls = [], [], [], []
+    target_latch = {}
+    for idx, (key, qw) in enumerate(engine_list):
+        c_in, c_out = qw.c_in, qw.c_out
+        gemv_decls.append(
+            f"  logic gen_{idx}, gd_{idx};\n"
+            f"  logic signed [{c_in*24-1}:0] gx_{idx};\n"
+            f"  logic signed [{c_out*24-1}:0] gy_{idx};")
+        words = c_out * ((c_in + simd - 1) // simd)
+        gemv_insts.append(
+            f"  gemv_{idx} #(.C_IN({c_in}),.C_OUT({c_out}),.SIMD({simd}),.WW({ww}),.ACT(24),"
+            f".RS({REQUANT_S}),.WORDS({words}),.NUM_BITS(24)) "
+            f"u_gv{idx}(.clk(clk),.rst_n(rst_n),.en(gen_{idx}),"
+            f".x(gx_{idx}),.yout(gy_{idx}),.done(gd_{idx}));")
+        src = inp_of[key]
+        gemv_drives.append(
+            f"  for (genvar G{idx}=0; G{idx}<{c_in}; G{idx}=G{idx}+1) "
+            f"assign gx_{idx}[G{idx}*24 +: 24] = {src}[G{idx}];")
+        tgt = target_of[key]
+        target_latch.setdefault(tgt, []).append((idx, c_out))
+
+    _latch_blocks = []
+    for tgt, items in target_latch.items():
+        parts = []
+        for k, (idx, c_out) in enumerate(items):
+            kw = "if" if k == 0 else "else if"
+            parts.append(f"{kw} (gd_{idx}) begin for (int ii=0; ii<{c_out}; ii=ii+1) "
+                         f"{tgt}[ii] <= gy_{idx}[ii*24 +: 24]; end")
+        parts.append("else ;")
+        _latch_blocks.append("  always_ff @(posedge clk) begin "
+                             + " ".join(parts) + " end")
+    gemv_latch = _latch_blocks
+
+    # 归一化：gsel/bsel 排序 = 每层 [ln_1.g, ln_1.b, ln_2.g, ln_2.b]，再 final [g,b]
+    norm_keys = []
+    for L in range(LYR):
+        norm_keys += [f'layers.{L}.ln_1.gamma', f'layers.{L}.ln_1.beta',
+                      f'layers.{L}.ln_2.gamma', f'layers.{L}.ln_2.beta']
+    norm_keys += ['final_norm.gamma', 'final_norm.beta']
+    norm_roms = "\n".join(
+        f"  logic signed [23:0] {_san(k)}_g [0:{int(v.size)-1}];\n"
+        f"  initial $readmemh(\"{_san(k)}.mem\", {_san(k)}_g);"
+        for k, v in qmodel.gammas.items())
+
+    # gamma / beta 选择器
+    def _sel(suffix):
+        rows = []
+        for gi, gk in enumerate(norm_keys):
+            if not gk.endswith(suffix):
+                continue
+            tgt = 'ln_gin' if suffix == 'gamma' else 'ln_bin'
+            body = " ".join(f"{tgt}[{j}*24 +: 24] = {_san(gk)}_g[{j}];"
+                            for j in range(H))
+            rows.append(f"      {gi}: begin {body} end")
+        return "\n".join(rows)
+
+    ln_gsel = _sel("gamma")
+    ln_bsel = _sel("beta")
+
+    state_defs, master_case = _build_master_gpt2(engine_list, cfg)
+
+    r = _TOP_TEMPLATE_GPT2
+    lo = -(1 << (qmodel.luts.gelu_input_bits - 1))
+    hi = (1 << (qmodel.luts.gelu_input_bits - 1)) - 1
+    repl = {
+        "MODNAME": f"{cfg['name']}_accel",
+        "H": H, "HEADS": HEADS, "HD": HD, "LYR": LYR, "SEQ": SEQ, "VOCAB": VOCAB,
+        "NINNER": int(cfg.get("n_inner", H * 4)),
+        "F": F, "RS": REQUANT_S, "RR": RR_DIV, "ACT": ACT_BITS,
+        "SILU_LO": lo, "SILU_HI": hi,
+        "GELU_LO": lo, "GELU_HI": hi, "GELU_SPAN": hi - lo,
+    }
+    for k, v in repl.items():
+        r = r.replace(f"@@{k}@@", str(v))
+    r = r.replace("@@NORM_ROMS@@", norm_roms)
+    r = r.replace("@@LN_GSEL@@", ln_gsel)
+    r = r.replace("@@LN_BSEL@@", ln_bsel)
+    r = r.replace("@@GEMV_DECLS@@", "\n".join(gemv_decls))
+    r = r.replace("@@GEMV_INSTS@@", "\n".join(gemv_insts))
+    r = r.replace("@@GEMV_DRIVES@@", "\n".join(gemv_drives))
+    r = r.replace("@@GEMV_LATCH@@", "\n".join(gemv_latch))
+    r = r.replace("@@STATE_DEFS@@", state_defs)
+    r = r.replace("@@MASTER_CASE@@", master_case)
+    return r
+
 
 def _emit_tb(qmodel, cfg: dict, modname: str) -> str:
+    SEQ = cfg["max_seq_len"]
+
     SEQ = cfg["max_seq_len"]
     VOCAB = cfg["vocab_size"]
     return rf'''
@@ -754,15 +1246,23 @@ def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
     modname = f"{cfg['name']}_accel"
     rdir = os.path.join(out_dir, backend_dir)
     os.makedirs(rdir, exist_ok=True)
-    top = _emit_top(qmodel, cfg)
+    is_gpt2 = cfg.get("architecture") == "gpt2"
+    top = _emit_top_gpt2(qmodel, cfg) if is_gpt2 else _emit_top(qmodel, cfg)
 
     # 每个 gemv 引擎一个独立模块（文件名硬编码，兼容 Yosys）
     engine_list = sorted(qmodel.engines.items())
     gemv_files = {}
     for idx, (key, qw) in enumerate(engine_list):
+        has_bias = getattr(qw, "bias_q", None) is not None
+        if is_gpt2 and has_bias:
+            gemv_tpl = GEMV_TEMPLATE_BIAS
+            g2_kw = dict(BF=qw.bias_rom_file or f"{_san(key)}_bias.mem")
+        else:
+            gemv_tpl = GEMV_TEMPLATE
+            g2_kw = {}
         gemv_files[f"gemv_{idx}.sv"] = _fill_module(
-            GEMV_TEMPLATE, qmodel,
-            GMOD=f"gemv_{idx}", WF=qw.rom_file, SF=qw.scale_rom_file)
+            gemv_tpl, qmodel,
+            GMOD=f"gemv_{idx}", WF=qw.rom_file, SF=qw.scale_rom_file, **g2_kw)
 
     files = {
         f"{modname}.sv": top,
@@ -771,6 +1271,8 @@ def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
         "attn.sv": _fill_module(ATTN_TEMPLATE, qmodel),
         "sim_tb.sv": _emit_tb(qmodel, cfg, modname),
     }
+    if is_gpt2:
+        files["layernorm.sv"] = _fill_module(LAYERNORM_TEMPLATE, qmodel)
     for fn, content in files.items():
         with open(os.path.join(rdir, fn), "w") as f:
             f.write(content)

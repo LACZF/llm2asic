@@ -88,18 +88,23 @@ class LUTSet:
     rsqrt: np.ndarray = None          # y = round(2^F * 1/sqrt(x)) for x=1..MAX
     sigmoid: np.ndarray = None        # y = round(2^F * sigmoid(x)) for x in inputs
     silu_gate: np.ndarray = None      # y = round(2^F * (x * sigmoid(x))) for x in inputs
+    gelu: np.ndarray = None           # y = round(2^F * gelu(x))  GPT-2
     exp_neg: np.ndarray = None        # y = round(2^F * exp(-x)) for x>=0,int
     recip2: np.ndarray = None         # y = round(2^FF / x) 倒数（softmax/除法用）
 
+    gelu_input_bits: int = 12
+
     @property
     def files(self) -> dict:
-        return {
+        d = {
             "rsqrt.mem": self.rsqrt,
             "sigmoid.mem": self.sigmoid,
             "silu.mem": self.silu_gate,
+            "gelu.mem": self.gelu,
             "exp_neg.mem": self.exp_neg,
             "recip.mem": self.recip2,
         }
+        return {k: v for k, v in d.items() if v is not None}
 
 
 def gen_luts(act_bits: int = ACT_BITS, Fbits: int = F, rsqrt_bits: int = 20) -> LUTSet:
@@ -124,6 +129,14 @@ def gen_luts(act_bits: int = ACT_BITS, Fbits: int = F, rsqrt_bits: int = 20) -> 
     lut.silu_gate = np.rint(xr * sig * SM).astype(np.int64)
     lut.sigmoid_input_bits = X
     lut.silu_input_bits = X
+
+    # 1b) gelu（GPT-2）：tanh 近似，输入裁剪到 [-2^(G-1), 2^(G-1)-1]
+    G = 12
+    xg = np.arange(-2**(G-1), 2**(G-1))
+    xgr = xg.astype(np.float64) / SM
+    t = np.tanh(np.sqrt(2.0 / np.pi) * (xgr + 0.044715 * xgr**3))
+    lut.gelu = np.rint((0.5 * xgr * (1.0 + t)) * SM).astype(np.int64)
+    lut.gelu_input_bits = G
 
     # 2) rsqrt：x = 归一化后的整数（0..MAX），y = round(2^F * 1/sqrt(x))
     #    项数 = 2^rsqrt_bits + 1（索引 0..2^rsqrt_bits）；默认 2^20+1 与历史一致。
@@ -164,6 +177,8 @@ class QWeight:
     row_rename: str = ""
     rom_file: str = ""
     scale_rom_file: str = ""
+    bias_q: np.ndarray = None        # [C_out] 定点 bias（可选，GPT-2）
+    bias_rom_file: str = ""
 
     @property
     def c_out(self):

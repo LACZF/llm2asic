@@ -14,7 +14,8 @@ from ..rtl_backend.numeric import QWeight, LUTSet
 class QuantizedModel:
     engines: dict = field(default_factory=dict)      # key -> QWeight（线性层）
     wte_q: np.ndarray = None                         # 嵌入定点整数 [vocab,hidden]
-    gammas: dict = field(default_factory=dict)       # key -> 定点 gamma
+    wpe_q: np.ndarray = None                         # 位置嵌入定点整数 [npos,hidden]（GPT-2）
+    gammas: dict = field(default_factory=dict)       # key -> 定点 gamma/beta
     luts: LUTSet = None                              # 定点查找表
     config: dict = field(default_factory=dict)       # 模型配置
     bit_width: int = 8

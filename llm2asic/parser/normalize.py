@@ -27,14 +27,25 @@ _STRIP_PREFIXES = ("model.", "transformer.", "llama.", "mistral.", "qwen2.",
 
 # 已知的别名映射（正则: canonical 局部名）
 _ALIASES: list[tuple[re.Pattern, Callable[[re.Match], str]]] = [
-    # GPT-2: h.{i}.ln_1 / ln_2 / attn.c_attn / mlp.c_fc,c_proj
-    (re.compile(r"h\.(\d+)\.ln_1\.weight"), lambda m: f"layers.{m[1]}.input_layernorm.weight"),
-    (re.compile(r"h\.(\d+)\.ln_2\.weight"), lambda m: f"layers.{m[1]}.post_attention_layernorm.weight"),
-    # GPT-2 三合一投影 c_attn；v1 仅支持单头 q/k/v，无法直接拆分，标记不支持
-    (re.compile(r"h\.(\d+)\.attn\.c_attn\.weight"), lambda m: f"!!unsupported:gpt2:c_attn:{m[1]}"),
-    (re.compile(r"h\.(\d+)\.attn\.c_proj\.weight"), lambda m: f"!!unsupported:gpt2:o_proj:{m[1]}"),
-    (re.compile(r"h\.(\d+)\.mlp\.c_fc\.weight"), lambda m: f"!!unsupported:gpt2:c_fc:{m[1]}"),
-    (re.compile(r"h\.(\d+)\.mlp\.c_proj\.weight"), lambda m: f"!!unsupported:gpt2:c_proj:{m[1]}"),
+    # GPT-2: 位置嵌入
+    (re.compile(r"wpe\.weight$"), lambda m: "wpe"),
+    # GPT-2: 层归一化 ln_1 / ln_2 / ln_f
+    (re.compile(r"h\.(\d+)\.ln_1\.weight$"), lambda m: f"layers.{m[1]}.ln_1.weight"),
+    (re.compile(r"h\.(\d+)\.ln_1\.bias$"),   lambda m: f"layers.{m[1]}.ln_1.bias"),
+    (re.compile(r"h\.(\d+)\.ln_2\.weight$"), lambda m: f"layers.{m[1]}.ln_2.weight"),
+    (re.compile(r"h\.(\d+)\.ln_2\.bias$"),   lambda m: f"layers.{m[1]}.ln_2.bias"),
+    (re.compile(r"ln_f\.weight$"), lambda m: "final_norm.weight"),
+    (re.compile(r"ln_f\.bias$"),   lambda m: "final_norm.bias"),
+    # GPT-2: attn.c_attn（融合 qkv）与 attn.c_proj（输出投影）
+    (re.compile(r"h\.(\d+)\.attn\.c_attn\.weight$"), lambda m: f"layers.{m[1]}.c_attn.weight"),
+    (re.compile(r"h\.(\d+)\.attn\.c_attn\.bias$"),   lambda m: f"layers.{m[1]}.c_attn.bias"),
+    (re.compile(r"h\.(\d+)\.attn\.c_proj\.weight$"), lambda m: f"layers.{m[1]}.c_attn_o.weight"),
+    (re.compile(r"h\.(\d+)\.attn\.c_proj\.bias$"),   lambda m: f"layers.{m[1]}.c_attn_o.bias"),
+    # GPT-2: mlp.c_fc / mlp.c_proj
+    (re.compile(r"h\.(\d+)\.mlp\.c_fc\.weight$"),    lambda m: f"layers.{m[1]}.mlp_fc.weight"),
+    (re.compile(r"h\.(\d+)\.mlp\.c_fc\.bias$"),      lambda m: f"layers.{m[1]}.mlp_fc.bias"),
+    (re.compile(r"h\.(\d+)\.mlp\.c_proj\.weight$"),  lambda m: f"layers.{m[1]}.mlp_proj.weight"),
+    (re.compile(r"h\.(\d+)\.mlp\.c_proj\.bias$"),    lambda m: f"layers.{m[1]}.mlp_proj.bias"),
 ]
 
 
@@ -61,7 +72,7 @@ def _canonical_weight_name(raw: str) -> str:
     # LLaMA/Qwen/Mistral 系 —— 已是接近 canonical 的命名，仅处理容器前缀差异
     # model.layers.N.self_attn.q_proj.weight -> layers.N.self_attn.q_proj.weight
     # model.embed_tokens.weight / wte -> wte
-    if name == "embed_tokens.weight" or name == "wte" or name == "transformer.wte.weight":
+    if name in ("embed_tokens.weight", "wte", "wte.weight", "transformer.wte.weight"):
         return "wte"
     if name == "lm_head.weight":
         return "lm_head.weight"
@@ -108,9 +119,13 @@ def normalize_config(raw: dict) -> dict:
     theta = float(g("rope_theta", default=10000.0))
     eps = float(g("rms_norm_eps", "layer_norm_eps", default=1e-5))
     tied = bool(g("tie_word_embeddings", default=False))
+    n_inner = int(g("n_inner", "intermediate_size", default=max(4, 4 * hidden)))
+    mt = str(g("model_type", "architecture", default="") or "").lower()
+    arch = "gpt2" if mt == "gpt2" else "llama"
 
     return {
         "name": str(g("_name_or_path", "model", default="model")),
+        "architecture": arch,
         "vocab_size": vocab,
         "hidden": hidden,
         "num_layers": num_layers,
@@ -120,6 +135,7 @@ def normalize_config(raw: dict) -> dict:
         "rope_theta": theta,
         "norm_eps": eps,
         "tied_embedding": tied,
+        "n_inner": n_inner,
     }
 
 
