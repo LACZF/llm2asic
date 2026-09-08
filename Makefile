@@ -39,7 +39,34 @@ GDS_TOP        ?=
 SINGLE         ?= 0
 RTL_SINGLE     := $(if $(filter 1,$(SINGLE)),--single-file)
 
-.PHONY: all test rtl synth gds clean
+.PHONY: help all test rtl synth gds clean
+
+help:
+	@echo "LLM2ASIC 常用命令（也直接支持 make 子命令: test/rtl/synth/gds/clean）"
+	@echo ""
+	@echo "  make            # 默认: test + rtl"
+	@echo "  make help       # 显示本帮助"
+	@echo "  make test       # 运行 pytest 测试套件"
+	@echo "  make rtl        # 端到端: 解析->量化->黄金参考->RTL->仿真逐位比对"
+	@echo "                  #   额外: SINGLE=1 合并产出单文件 RTL (*_single.sv)"
+	@echo "  make synth      # Yosys 综合出网表 (BACKEND=fpga|asic, PDK, LIBERTY=)"
+	@echo "  make gds        # 一键 RTL->OpenROAD flow->最终 GDS (需 iverilog/yosys/OpenROAD)"
+	@echo "  make clean      # 清理构建产物与缓存"
+	@echo ""
+	@echo "常用变量:"
+	@echo "  MODEL=路径      模型 YAML (默认 examples/gpt2_tiny/model.yaml)"
+	@echo "  OUT=目录        输出目录 (默认 build_gds)"
+	@echo "  SINGLE=1        额外输出单文件 RTL"
+	@echo "  GDS_PLATFORM=   GDS 目标 PDK (默认 sky130hd)"
+	@echo "  GDS_SKIP_DRT=1  1=跳过详细布线省内存 (默认)"
+	@echo "  GDS_TOP=名字    顶层模块名 (默认从 OUT/rtl/*_accel.sv 推断)"
+	@echo "  ORFS=路径       OpenROAD-flow-scripts 根目录 (自动探测)"
+	@echo "  BACKEND=        synth 后端: fpga(默认)|asic   PDK=/LIBERTY= (asic 用)"
+	@echo ""
+	@echo "示例:"
+	@echo "  make gds"
+	@echo "  make gds MODEL=examples/llama_tiny/model.yaml OUT=build_llama"
+	@echo "  make rtl SINGLE=1"
 
 all: test rtl
 

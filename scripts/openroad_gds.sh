@@ -104,8 +104,10 @@ mkdir -p "$SRC_V" "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"
 
 # 归置 verilog + .mem 到 flow designs/src/<design>/ (cp -u: 已存在则不触碰 mtime,
-# 避免 make 因源文件变新而重新综合)
+# 避免 make 因源文件变新而重新综合)。*_single.sv 是合并冗余文件, 不参与综合,
+# 仅作为交付产物保留在 RTL 目录, 这里不复制以免与分模块文件重复定义模块。
 cp -fu "$RTL_DIR"/*.sv "$SRC_V"/ 2>/dev/null || true
+for f in "$SRC_V"/*_single.sv; do rm -f "$f"; done 2>/dev/null || true
 cp -fu "$RTL_DIR"/*.mem "$SRC_V"/ 2>/dev/null || true
 # yosys 以 flow/ 为 CWD 运行, $readmemh("xxx.mem") 相对 CWD 解析,
 # 因此 mem 也复制到 flow 根目录, 避免 ROM 内容丢失(全部为 0)。
