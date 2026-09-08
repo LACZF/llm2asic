@@ -66,6 +66,7 @@ class CompileConfig:
     # RTL / 验证
     max_cycles: int = 200000
     enable_sim: bool = True
+    single_file: bool = False   # 额外产出单文件 RTL（所有模块合并成一个 .sv）
     raw: dict = field(default_factory=dict)
 
 
@@ -133,6 +134,7 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
         n_calib_tokens=int(build_d.get("n_calib_tokens", 8)),
         max_cycles=int(build_d.get("max_cycles", 200000)),
         enable_sim=bool(build_d.get("enable_sim", True)),
+        single_file=bool(build_d.get("single_file", False)),
         raw=raw,
     )
     return cfg

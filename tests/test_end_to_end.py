@@ -178,3 +178,54 @@ def test_gpt2_generated_rtl_compiles(qmodel_gpt2):
            os.path.join(rdir, "sim_tb.sv")]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     assert proc.returncode == 0, f"iverilog 失败:\n{proc.stdout}\n{proc.stderr}"
+
+
+# --------------------------------------------------------------------------
+# 单文件 RTL：所有模块合并成一个 *_single.sv（除 sim_tb 外），编译并可仿真。
+# --------------------------------------------------------------------------
+
+def test_single_file_rtl_emitted(qmodel_gpt2):
+    """single_file=True 时应产出 *_single.sv，且包含全部非测试台模块。"""
+    mpath, cfg, qm, out = qmodel_gpt2
+    cfg.single_file = True
+    toks = GPT2_TOKENS[: qm.config["max_seq_len"]]
+    res = backend_run(mpath, cfg, tokens=toks)
+
+    assert res.errors == []
+    assert res.single_file_path and os.path.exists(res.single_file_path)
+    sf = open(res.single_file_path).read()
+    mod = f"{qm.config['name']}_accel"
+    for pat in ("module " + mod, "module gemv_0", "module layernorm",
+                "module attn"):
+        assert pat in sf, f"单文件缺少 {pat}"
+    assert "module testbench" not in sf, "单文件不应含 sim_tb"
+
+
+@pytest.mark.skipif(not _have_iverilog(),
+                    reason="需要 Icarus Verilog（iverilog/vvp）")
+def test_single_file_rtl_sim_matches(qmodel_gpt2):
+    """合并的单文件 + sim_tb 应能仿真，且与多文件逐位一致。"""
+    mpath, cfg, qm, out = qmodel_gpt2
+    cfg.single_file = True
+    toks = GPT2_TOKENS[: qm.config["max_seq_len"]]
+    res = backend_run(mpath, cfg, tokens=toks)
+    assert res.errors == [] and res.sim_ran and res.bit_exact
+
+    rdir = os.path.join(out, "rtl")
+    mod = f"{qm.config['name']}_accel"
+    sim_multi = np.array([int(float(x)) for x in
+                          open(os.path.join(rdir, "sim_logits.txt")).read().split()])
+    vvp = os.path.join(rdir, "sim_single.vvp")
+    proc = subprocess.run(
+        ["iverilog", "-g2012", "-o", vvp,
+         os.path.join(rdir, f"{mod}_single.sv"),
+         os.path.join(rdir, "sim_tb.sv")],
+        cwd=rdir, capture_output=True, text=True)
+    assert proc.returncode == 0, f"单文件 iverilog 失败:\n{proc.stdout}\n{proc.stderr}"
+    proc = subprocess.run(["vvp", vvp], cwd=rdir,
+                          capture_output=True, text=True)
+    assert "SIM_DONE" in proc.stdout, f"单文件仿真失败:\n{proc.stdout}\n{proc.stderr}"
+    sim_single = np.array([int(float(x)) for x in
+                           open(os.path.join(rdir, "sim_logits.txt")).read().split()])
+    assert sim_single.shape == sim_multi.shape
+    assert np.array_equal(sim_single, sim_multi), "单文件与多文件仿真不一致"

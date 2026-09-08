@@ -15,6 +15,7 @@
 #                   #   GDS_SKIP_DRT=0|1   1(默认)跳过详细布线省内存
 #                   #   GDS_TOP=<顶层名>    默认从 $(OUT)/rtl/*_accel.sv 推断
 #                   #   ORFS=<OpenROAD-flow-scripts 根目录> 可选覆盖自动探测
+#                   #   SINGLE=1           额外产出合并的单文件 RTL (*_single.sv)
 #   make clean      # 清理构建产物与缓存
 #
 # 说明：llm2asic 无需安装，Python 入口通过 PYTHONPATH=. 指向本仓库源码。
@@ -35,6 +36,8 @@ LIBERTY    ?=
 GDS_PLATFORM   ?= sky130hd
 GDS_SKIP_DRT   ?= 1
 GDS_TOP        ?=
+SINGLE         ?= 0
+RTL_SINGLE     := $(if $(filter 1,$(SINGLE)),--single-file)
 
 .PHONY: all test rtl synth gds clean
 
@@ -44,7 +47,7 @@ all: test rtl
 rtl:
 	@echo "==> [rtl_backend] 生成 RTL 到 $(OUT)/rtl 并仿真验证"
 	@PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m llm2asic build \
-		--model $(MODEL) --out $(OUT)
+		--model $(MODEL) --out $(OUT) $(RTL_SINGLE)
 	@echo "==> [rtl] 完成。RTL: $(OUT)/rtl/  | 报告: $(OUT)/test_report.json"
 
 # 测试套件

@@ -34,6 +34,7 @@ class RTLResult:
     gold_path: str = ""
     sim_logits_path: str = ""
     report_path: str = ""
+    single_file_path: str = ""
     errors: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -46,6 +47,7 @@ class RTLResult:
             "sim_ran": self.sim_ran,
             "gold_path": self.gold_path,
             "sim_logits_path": self.sim_logits_path,
+            "single_file_path": self.single_file_path,
             "errors": self.errors,
         }
 
@@ -133,8 +135,11 @@ def run(model_path: str,
         result.gold_path = os.path.join(out, "gold.npy")
 
         # 4. 生成 RTL 并复制权重 ROM
-        modname = generate(qm, qm.config, out, toks)
+        modname = generate(qm, qm.config, out, toks, single_file=cfg.single_file)
         rdir = os.path.join(out, "rtl")
+        if cfg.single_file:
+            result.single_file_path = os.path.join(rdir, f"{modname}_single.sv")
+            print(f"[rtl_backend] 单文件 RTL -> {result.single_file_path}")
         src = os.path.join(out, "quantizer", "weights_rom")
         for fn in sorted(os.listdir(src)):
             if fn.endswith(".mem"):

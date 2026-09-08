@@ -22,6 +22,8 @@ def _build(args) -> int:
         cfg.out_dir = args.out
     if args.no_sim:
         cfg.enable_sim = False
+    if args.single_file:
+        cfg.single_file = True
 
     result = run(cfg.model_path, cfg)
 
@@ -58,6 +60,8 @@ def _synth(args) -> int:
         cfg.synth.liberty = args.liberty
     if args.pdk:
         cfg.synth.pdk = args.pdk
+    if hasattr(args, "single_file") and args.single_file:
+        cfg.single_file = True
 
     # 确保 RTL 已生成
     rtl_dir = os.path.join(cfg.out_dir, "rtl")
@@ -94,6 +98,8 @@ def main(argv=None) -> int:
     p_build.add_argument("--out", help="输出目录")
     p_build.add_argument("--no-sim", action="store_true",
                          help="仅生成 RTL，不跑仿真")
+    p_build.add_argument("--single-file", action="store_true",
+                         help="额外产出合并的单文件 RTL (*_single.sv)")
     p_build.set_defaults(func=_build)
 
     p_synth = sub.add_parser("synth", help="综合已生成 RTL 为门级网表")
@@ -106,6 +112,8 @@ def main(argv=None) -> int:
                          help="综合后端（覆盖配置）")
     p_synth.add_argument("--liberty", help="ASIC 标准单元 .lib 路径")
     p_synth.add_argument("--pdk", help="PDK 名（仅用于报告）")
+    p_synth.add_argument("--single-file", action="store_true",
+                         help="生成时额外产出合并的单文件 RTL (*_single.sv)")
     p_synth.set_defaults(func=_synth)
 
     args = parser.parse_args(argv)

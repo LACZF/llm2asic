@@ -1249,8 +1249,17 @@ def _fill_module(s: str, qmodel, **kw) -> str:
              .replace("@@RRFN@@", _RR_FN.strip()))
 
 
+def _write_idem(path: str, content: str) -> bool:
+    """幂等写：内容不变时保持 mtime（避免 SDC/综合把 RTL 视为变更重跑）。"""
+    if os.path.exists(path) and open(path, "r").read() == content:
+        return False
+    with open(path, "w") as f:
+        f.write(content)
+    return True
+
+
 def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
-             backend_dir: str = "rtl") -> str:
+             backend_dir: str = "rtl", single_file: bool = False) -> str:
     """生成 RTL 文件到 out_dir/rtl。返回顶层模块名。返回主 .sv 路径。"""
     modname = f"{cfg['name']}_accel"
     rdir = os.path.join(out_dir, backend_dir)
@@ -1283,14 +1292,18 @@ def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
     if is_gpt2:
         files["layernorm.sv"] = _fill_module(LAYERNORM_TEMPLATE, qmodel)
     for fn, content in files.items():
-        path = os.path.join(rdir, fn)
-        if os.path.exists(path) and open(path, "r").read() == content:
-            continue  # 幂等: 内容不变时不重写, 保持 mtime, 避免反复触发综合
-        with open(path, "w") as f:
-            f.write(content)
+        _write_idem(os.path.join(rdir, fn), content)
     path = os.path.join(rdir, "tokens.mem")
     tcontent = "".join(f"{int(t):x}\n" for t in np.asarray(tokens).reshape(-1))
     if not (os.path.exists(path) and open(path, "r").read() == tcontent):
         with open(path, "w") as f:
             f.write(tcontent)
+
+    if single_file:
+        sf = f"{modname}_single.sv"
+        # 依赖在前：gemv 引擎 -> layernorm/rmsnorm -> attn -> 顶层
+        order = list(gemv_files) + ["layernorm.sv" if is_gpt2 else "rmsnorm.sv",
+                                    "attn.sv", f"{modname}.sv"]
+        _write_idem(os.path.join(rdir, sf),
+                    "\n".join(files[n].rstrip() for n in order) + "\n")
     return modname
