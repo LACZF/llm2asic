@@ -138,7 +138,10 @@ def run(model_path: str,
         src = os.path.join(out, "quantizer", "weights_rom")
         for fn in sorted(os.listdir(src)):
             if fn.endswith(".mem"):
-                shutil.copy(os.path.join(src, fn), os.path.join(rdir, fn))
+                s, d = os.path.join(src, fn), os.path.join(rdir, fn)
+                if os.path.exists(d) and open(s, "rb").read() == open(d, "rb").read():
+                    continue  # 幂等: 内容相同不覆盖, 保持 mtime
+                shutil.copy(s, d)
 
         # 5. 仿真（iverilog + vvp）
         if cfg.enable_sim:

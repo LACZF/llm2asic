@@ -59,7 +59,7 @@ def quantize_graph(graph, quant_cfg):
     """
     bw = quant_cfg.default_weight.bit_width
     group = quant_cfg.default_weight.group_size
-    luts = gen_luts(rsqrt_bits=getattr(quant_cfg, "rsqrt_lut_bits", 20))
+    luts = gen_luts(rsqrt_bits=getattr(quant_cfg, "rsqrt_lut_bits", 14))
     arch = str(graph.config.get("architecture", "llama")).lower()
 
     engines = {}

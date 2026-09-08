@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 F = 12            # 全局激活分数位
-ACT_BITS = 24     # 激活整型位宽（有符号）
+ACT_BITS = 16     # 激活整型位宽（有符号）
 
 
 def banker_round_shift(v: int, k: int) -> int:

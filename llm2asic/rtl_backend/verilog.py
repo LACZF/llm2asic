@@ -14,6 +14,7 @@ import numpy as np
 
 from .numeric import F, REQUANT_S, ACT_BITS
 
+ACTW = ACT_BITS    # gemv 示例化/连线使用与全局一致的激活宽度
 EF = 10
 RR_DIV = 2 * F
 
@@ -458,7 +459,7 @@ def _build_master(engine_list, cfg):
         emit(st_en, f"rms_en<=1; rms_src<={src}; rms_gsel<={gsel}; "
                     f"S<={sn[st_w]};")
         cap = (f"for(int i=0;i<H;i=i+1) {target}[i]"
-               f"<=$signed(rms_yout[i*24 +: 24]);") if target else ""
+               f"<=$signed(rms_yout[i*{ACTW} +: {ACTW}]);") if target else ""
         emit(st_w, f"rms_en<=0; if(rms_done) begin {cap} S<={sn[st_done_next]}; "
                    f"end else S<={sn[st_w]};")
 
@@ -477,7 +478,7 @@ def _build_master(engine_list, cfg):
                        f"S<={sn[f'AT{L}W']};")
         emit(f"AT{L}W",
              f"att_en<=0; if(att_done) begin "
-             f"for(int i=0;i<H;i=i+1) att[i]<=$signed(att_yout[i*24 +: 24]); "
+             f"for(int i=0;i<H;i=i+1) att[i]<=$signed(att_yout[i*{ACTW} +: {ACTW}]); "
              f"S<={sn[f'AH{L}']}; end else S<={sn[f'AT{L}W']};")
         emit(f"AH{L}", f"S<={sn[f'R1{L}']};")
         rms_en_wait(f"R1{L}", 1, 2 * L + 1, f"g{L}", "n2")
@@ -737,18 +738,18 @@ def _emit_top(qmodel, cfg: dict) -> str:
         c_in, c_out = qw.c_in, qw.c_out
         gemv_decls.append(
             f"  logic gen_{idx}, gd_{idx};\n"
-            f"  logic signed [{c_in*24-1}:0] gx_{idx};\n"
-            f"  logic signed [{c_out*24-1}:0] gy_{idx};")
+            f"  logic signed [{c_in*ACTW-1}:0] gx_{idx};\n"
+            f"  logic signed [{c_out*ACTW-1}:0] gy_{idx};")
         words = c_out * ((c_in + simd - 1) // simd)
         gemv_insts.append(
-            f"  gemv_{idx} #(.C_IN({c_in}),.C_OUT({c_out}),.SIMD({simd}),.WW({ww}),.ACT(24),"
+            f"  gemv_{idx} #(.C_IN({c_in}),.C_OUT({c_out}),.SIMD({simd}),.WW({ww}),.ACT({ACTW}),"
             f".RS({REQUANT_S}),.WORDS({words}),.NUM_BITS(24)) "
             f"u_gv{idx}(.clk(clk),.rst_n(rst_n),.en(gen_{idx}),"
             f".x(gx_{idx}),.yout(gy_{idx}),.done(gd_{idx}));")
         src = inp_of[key]
         gemv_drives.append(
             f"  for (genvar G{idx}=0; G{idx}<{H}; G{idx}=G{idx}+1) "
-            f"assign gx_{idx}[G{idx}*24 +: 24] = {src}[G{idx}];")
+            f"assign gx_{idx}[G{idx}*{ACTW} +: {ACTW}] = {src}[G{idx}];")
         tgt = target_of[key]; c_out = qw.c_out
         target_latch.setdefault(tgt, []).append((idx, c_out))
 
@@ -757,7 +758,7 @@ def _emit_top(qmodel, cfg: dict) -> str:
         parts = []
         for k, (idx, c_out) in enumerate(items):
             kw = "if" if k == 0 else "else if"
-            parts.append(f"{kw} (gd_{idx}) begin for (int ii=0; ii<{c_out}; ii=ii+1) {tgt}[ii] <= gy_{idx}[ii*24 +: 24]; end")
+            parts.append(f"{kw} (gd_{idx}) begin for (int ii=0; ii<{c_out}; ii=ii+1) {tgt}[ii] <= gy_{idx}[ii*{ACTW} +: {ACTW}]; end")
         parts.append("else ;")
         _latch_blocks.append("  always_ff @(posedge clk) begin " + " ".join(parts) + " end")
     gemv_latch = _latch_blocks
@@ -788,7 +789,7 @@ def _emit_top(qmodel, cfg: dict) -> str:
     for gi, gk in enumerate(norm_keys):
         arr = qmodel.gammas[gk]
         body = " ".join(
-            f"rms_gin[{i}*24 +: 24] = {_san(gk)}_g[{i}];" for i in range(H))
+            f"rms_gin[{i}*{ACTW} +: {ACTW}] = {_san(gk)}_g[{i}];" for i in range(H))
         rms_gsel.append(f"      {gi}: begin {body} end")
     rms_gsel = "\n".join(rms_gsel)
 
@@ -818,6 +819,10 @@ def _emit_top(qmodel, cfg: dict) -> str:
     r = r.replace("@@RMS_GSEL@@", rms_gsel)
     r = r.replace("@@STATE_DEFS@@", state_defs)
     r = r.replace("@@MASTER_CASE@@", master_case)
+    r = r.replace(
+        "S<=S_IDLE; done<=0; tokk<=0; rms_en<=0; att_en<=0; att_layer<=0;",
+        "S<=S_IDLE; done<=0; tokk<=0; rms_en<=0; att_en<=0; att_layer<=0;"
+        + "".join(f" gen_{i}<=0;" for i in range(len(engine_list))))
     return r
 
 
@@ -874,7 +879,7 @@ def _build_master_gpt2(engine_list, cfg):
                     f"ln_xsel<={xsel}; S<={sn[st_w]};")
         emit(st_w, f"ln_en<=0; if(ln_done) begin "
                    f"for(int i=0;i<H;i=i+1) {target}[i]<="
-                   f"$signed(ln_yout[i*24 +: 24]); S<={sn[st_done_next]}; "
+                   f"$signed(ln_yout[i*{ACTW} +: {ACTW}]); S<={sn[st_done_next]}; "
                    f"end else S<={sn[st_w]};")
 
     for L in range(LYR):
@@ -890,7 +895,7 @@ def _build_master_gpt2(engine_list, cfg):
                        f"S<={sn[f'AT{L}W']};")
         emit(f"AT{L}W", f"att_en<=0; if(att_done) begin "
                         f"for(int i=0;i<H;i=i+1) att[i]<="
-                        f"$signed(att_yout[i*24 +: 24]); S<={sn[f'o{L}']}; "
+                        f"$signed(att_yout[i*{ACTW} +: {ACTW}]); S<={sn[f'o{L}']}; "
                         f"end else S<={sn[f'AT{L}W']};")
         gemv_en_wait(f"o{L}", idx_of(f"{L}.o"), f"AH{L}")
         emit(f"AH{L}", (f"for(int i=0;i<H;i=i+1) begin "
@@ -1096,18 +1101,18 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
         c_in, c_out = qw.c_in, qw.c_out
         gemv_decls.append(
             f"  logic gen_{idx}, gd_{idx};\n"
-            f"  logic signed [{c_in*24-1}:0] gx_{idx};\n"
-            f"  logic signed [{c_out*24-1}:0] gy_{idx};")
+            f"  logic signed [{c_in*ACTW-1}:0] gx_{idx};\n"
+            f"  logic signed [{c_out*ACTW-1}:0] gy_{idx};")
         words = c_out * ((c_in + simd - 1) // simd)
         gemv_insts.append(
-            f"  gemv_{idx} #(.C_IN({c_in}),.C_OUT({c_out}),.SIMD({simd}),.WW({ww}),.ACT(24),"
+            f"  gemv_{idx} #(.C_IN({c_in}),.C_OUT({c_out}),.SIMD({simd}),.WW({ww}),.ACT({ACTW}),"
             f".RS({REQUANT_S}),.WORDS({words}),.NUM_BITS(24)) "
             f"u_gv{idx}(.clk(clk),.rst_n(rst_n),.en(gen_{idx}),"
             f".x(gx_{idx}),.yout(gy_{idx}),.done(gd_{idx}));")
         src = inp_of[key]
         gemv_drives.append(
             f"  for (genvar G{idx}=0; G{idx}<{c_in}; G{idx}=G{idx}+1) "
-            f"assign gx_{idx}[G{idx}*24 +: 24] = {src}[G{idx}];")
+            f"assign gx_{idx}[G{idx}*{ACTW} +: {ACTW}] = {src}[G{idx}];")
         tgt = target_of[key]
         target_latch.setdefault(tgt, []).append((idx, c_out))
 
@@ -1117,7 +1122,7 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
         for k, (idx, c_out) in enumerate(items):
             kw = "if" if k == 0 else "else if"
             parts.append(f"{kw} (gd_{idx}) begin for (int ii=0; ii<{c_out}; ii=ii+1) "
-                         f"{tgt}[ii] <= gy_{idx}[ii*24 +: 24]; end")
+                         f"{tgt}[ii] <= gy_{idx}[ii*{ACTW} +: {ACTW}]; end")
         parts.append("else ;")
         _latch_blocks.append("  always_ff @(posedge clk) begin "
                              + " ".join(parts) + " end")
@@ -1141,7 +1146,7 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
             if not gk.endswith(suffix):
                 continue
             tgt = 'ln_gin' if suffix == 'gamma' else 'ln_bin'
-            body = " ".join(f"{tgt}[{j}*24 +: 24] = {_san(gk)}_g[{j}];"
+            body = " ".join(f"{tgt}[{j}*{ACTW} +: {ACTW}] = {_san(gk)}_g[{j}];"
                             for j in range(H))
             rows.append(f"      {gi}: begin {body} end")
         return "\n".join(rows)
@@ -1173,6 +1178,10 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
     r = r.replace("@@GEMV_LATCH@@", "\n".join(gemv_latch))
     r = r.replace("@@STATE_DEFS@@", state_defs)
     r = r.replace("@@MASTER_CASE@@", master_case)
+    r = r.replace(
+        "S<=S_IDLE; done<=0; tokk<=0; ln_en<=0; ln_xsel<=0; att_en<=0; att_layer<=0;",
+        "S<=S_IDLE; done<=0; tokk<=0; ln_en<=0; ln_xsel<=0; att_en<=0; att_layer<=0;"
+        + "".join(f" gen_{i}<=0;" for i in range(len(engine_list))))
     return r
 
 
@@ -1274,9 +1283,14 @@ def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
     if is_gpt2:
         files["layernorm.sv"] = _fill_module(LAYERNORM_TEMPLATE, qmodel)
     for fn, content in files.items():
-        with open(os.path.join(rdir, fn), "w") as f:
+        path = os.path.join(rdir, fn)
+        if os.path.exists(path) and open(path, "r").read() == content:
+            continue  # 幂等: 内容不变时不重写, 保持 mtime, 避免反复触发综合
+        with open(path, "w") as f:
             f.write(content)
-    with open(os.path.join(rdir, "tokens.mem"), "w") as f:
-        for t in np.asarray(tokens).reshape(-1):
-            f.write(f"{int(t):x}\n")
+    path = os.path.join(rdir, "tokens.mem")
+    tcontent = "".join(f"{int(t):x}\n" for t in np.asarray(tokens).reshape(-1))
+    if not (os.path.exists(path) and open(path, "r").read() == tcontent):
+        with open(path, "w") as f:
+            f.write(tcontent)
     return modname

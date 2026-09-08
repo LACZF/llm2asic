@@ -5,3 +5,5 @@ build/
 build_out/
 dist/
 .pytest_cache/
+build_gds/
+build_reduced/

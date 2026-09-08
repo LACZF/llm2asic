@@ -99,7 +99,7 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
         activation_bit_width=int(quant_d.get("activation", {}).get("bit_width", 8)),
         threshold=float(quant_d.get("target_metric_deg", 0.05)),
         sparse=bool(quant_d.get("sparse", False)),
-        rsqrt_lut_bits=int(quant_d.get("rsqrt_lut_bits", 20)),
+        rsqrt_lut_bits=int(quant_d.get("rsqrt_lut_bits", 14)),
     )
     arch_d = raw.get("arch", {}) or {}
     arch = ArchConfig(
