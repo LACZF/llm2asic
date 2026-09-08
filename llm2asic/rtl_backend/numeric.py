@@ -21,7 +21,17 @@ from dataclasses import dataclass, field
 import numpy as np
 
 F = 12            # 全局激活分数位
-ACT_BITS = 16     # 激活整型位宽（有符号）
+ACT_BITS = 16     # 激活整型位宽（有符号）；可在 build.act_bits 按模型覆盖
+
+
+def set_act_bits(bits: int) -> None:
+    """按模型覆盖激活总线位宽。
+
+    llama_tiny 在 ACT=16 下存在中间溢出（与参考的裁剪语义不一致），
+    需 ACT=24 才逐位一致；gpt2_tiny 在 16 位下即逐位一致。
+    """
+    global ACT_BITS
+    ACT_BITS = int(bits)
 
 
 def banker_round_shift(v: int, k: int) -> int:

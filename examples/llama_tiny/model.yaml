@@ -8,3 +8,5 @@ num_layers: 2
 rope_theta: 10000.0
 tied_embedding: false
 vocab_size: 32
+build:
+  act_bits: 24   # llama 在 ACT=16 下中间溢出(0/256); 24 位逐位一致

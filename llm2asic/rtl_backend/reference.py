@@ -13,18 +13,21 @@ import math
 
 import numpy as np
 
-from .numeric import F, REQUANT_S, ACT_BITS, QWeight, LUTSet, banker_round_shift
+from . import numeric
+from .numeric import F, REQUANT_S, QWeight, LUTSet, banker_round_shift
 
 EF = 10        # softmax exp 的分数位
 RR = 2 * F     # 倒数 LUT 的分数位
 
-ACT_LO = -(1 << (ACT_BITS - 1))
-ACT_HI = (1 << (ACT_BITS - 1)) - 1
-
 
 def clamp_act(x):
-    """把中间激活裁剪到 ACT_BITS 有符号范围（与 RTL 24 位寄存器语义一致）。"""
-    return np.clip(np.asarray(x, dtype=np.int64), ACT_LO, ACT_HI).astype(np.int64)
+    """把中间激活裁剪到 ACT_BITS 有符号范围（与 RTL ACT 位总线语义一致）。
+
+    位宽动态跟随 numeric.ACT_BITS（默认 16，llama_tiny 用 24）。
+    """
+    lo = -(1 << (numeric.ACT_BITS - 1))
+    hi = (1 << (numeric.ACT_BITS - 1)) - 1
+    return np.clip(np.asarray(x, dtype=np.int64), lo, hi).astype(np.int64)
 
 
 def rshift_round(v: np.ndarray, n: int):

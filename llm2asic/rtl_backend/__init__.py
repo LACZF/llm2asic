@@ -109,6 +109,25 @@ def run(model_path: str,
     os.makedirs(out, exist_ok=True)
     result = RTLResult(out_dir=out)
 
+    # 每模型覆盖激活总线位宽（gold 参考 clamp 与 RTL ACTW 同步跟随）
+    # 优先级: cfg.act_bits(显式) > 模型 YAML 的 build.act_bits > 默认 16。
+    # 非 .yaml 来源(safetensors/onnx/bin)退回读取相邻 model.yaml 的 build 项。
+    from . import numeric as _numeric
+    act_bits = cfg.act_bits
+    if act_bits is None and isinstance(model_path, str) and os.path.exists(model_path):
+        import yaml as _yaml
+        mf = model_path
+        if not mf.endswith(".yaml"):
+            sibling = os.path.join(os.path.dirname(os.path.abspath(mf)), "model.yaml")
+            mf = sibling if os.path.exists(sibling) else ""
+        if mf:
+            with open(mf, "r", encoding="utf-8") as _f:
+                _raw = _yaml.safe_load(_f) or {}
+            act_bits = int((_raw.get("build", {}) or {}).get("act_bits", 16))
+    if act_bits is None:
+        act_bits = 16
+    _numeric.set_act_bits(act_bits)
+
     # 惰性导入，避免 parser/quantizer <-> rtl_backend 循环依赖
     from ..parser.builder import run_from_path
     from ..quantizer.pipeline import run as quantizer_run

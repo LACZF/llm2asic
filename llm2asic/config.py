@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Optional
 
 import yaml
 
@@ -67,6 +68,7 @@ class CompileConfig:
     max_cycles: int = 200000
     enable_sim: bool = True
     single_file: bool = False   # 额外产出单文件 RTL（所有模块合并成一个 .sv）
+    act_bits: Optional[int] = None   # RTL 激活总线位宽；None=读模型 build.act_bits(默认16)
     raw: dict = field(default_factory=dict)
 
 
@@ -135,6 +137,7 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
         max_cycles=int(build_d.get("max_cycles", 200000)),
         enable_sim=bool(build_d.get("enable_sim", True)),
         single_file=bool(build_d.get("single_file", False)),
+        act_bits=int(build_d["act_bits"]) if "act_bits" in build_d else None,
         raw=raw,
     )
     return cfg

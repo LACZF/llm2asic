@@ -8,3 +8,5 @@ num_layers: 1
 rope_theta: 10000.0
 tied_embedding: false
 vocab_size: 16
+build:
+  act_bits: 24   # 16 位下中间溢出(0/64); 24 位逐位一致

@@ -12,9 +12,16 @@ import os
 
 import numpy as np
 
+from . import numeric
 from .numeric import F, REQUANT_S, ACT_BITS
 
-ACTW = ACT_BITS    # gemv 示例化/连线使用与全局一致的激活宽度
+ACTW = ACT_BITS    # 默认 16；generate() 前按 numeric.ACT_BITS 同步（模型可覆盖）
+
+
+def _sync_actw() -> None:
+    """让 ACTW 跟随 numeric.ACT_BITS（build.act_bits 每模型覆盖后刷新）。"""
+    global ACTW
+    ACTW = numeric.ACT_BITS
 EF = 10
 RR_DIV = 2 * F
 
@@ -799,7 +806,7 @@ def _emit_top(qmodel, cfg: dict) -> str:
     repl = {
         "MODNAME": f"{cfg['name']}_accel",
         "H": H, "HEADS": HEADS, "HD": HD, "LYR": LYR, "SEQ": SEQ, "VOCAB": VOCAB,
-        "F": F, "RS": REQUANT_S, "RR": RR_DIV, "ACT": ACT_BITS,
+        "F": F, "RS": REQUANT_S, "RR": RR_DIV, "ACT": ACTW,
         "SILU_LO": -(1 << (cfg.get('silu_input_bits', qmodel.luts.silu_input_bits) - 1)),
         "SILU_HI": (1 << (cfg.get('silu_input_bits', qmodel.luts.silu_input_bits) - 1)) - 1,
     }
@@ -1163,7 +1170,7 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
         "MODNAME": f"{cfg['name']}_accel",
         "H": H, "HEADS": HEADS, "HD": HD, "LYR": LYR, "SEQ": SEQ, "VOCAB": VOCAB,
         "NINNER": int(cfg.get("n_inner", H * 4)),
-        "F": F, "RS": REQUANT_S, "RR": RR_DIV, "ACT": ACT_BITS,
+        "F": F, "RS": REQUANT_S, "RR": RR_DIV, "ACT": ACTW,
         "SILU_LO": lo, "SILU_HI": hi,
         "GELU_LO": lo, "GELU_HI": hi, "GELU_SPAN": hi - lo,
     }
@@ -1264,6 +1271,7 @@ def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
     modname = f"{cfg['name']}_accel"
     rdir = os.path.join(out_dir, backend_dir)
     os.makedirs(rdir, exist_ok=True)
+    _sync_actw()
     is_gpt2 = cfg.get("architecture") == "gpt2"
     top = _emit_top_gpt2(qmodel, cfg) if is_gpt2 else _emit_top(qmodel, cfg)
 
