@@ -44,7 +44,7 @@ GDS_TOP        ?=
 SINGLE         ?= 0
 RTL_SINGLE     := $(if $(filter 1,$(SINGLE)),--single-file)
 
-.PHONY: help all test rtl rtl-all synth gds clean
+.PHONY: help all test rtl rtl-all synth gds lint lint-all clean
 
 help:
 	@echo "LLM2ASIC 常用命令（也直接支持 make 子命令: test/rtl/synth/gds/clean）"
@@ -56,6 +56,8 @@ help:
 	@echo "                  #   产物输出到 \$(OUT)/<模型名>/  (按名称自动归类)"
 	@echo "                  #   额外: SINGLE=1 合并产出单文件 RTL (*_single.sv)"
 	@echo "  make rtl-all    # 一次转换 examples/ 下全部模型(声明式+外部格式)为 RTL"
+	@echo "  make lint       # Verilator 检查 RTL, 报告到 \$(MODEL_OUT)/lint_report.txt"
+	@echo "  make lint-all   # 对 examples/ 下全部模型逐个 lint"
 	@echo "  make synth      # Yosys 综合出网表 (BACKEND=fpga|asic, PDK, LIBERTY=)"
 	@echo "  make gds        # 一键 RTL->OpenROAD flow->最终 GDS (需 iverilog/yosys/OpenROAD)"
 	@echo "  make clean      # 清理构建产物与缓存"
@@ -108,6 +110,33 @@ rtl-all:
 		echo "==> [rtl-all] 全部 $$n 个模型成功"; \
 	else \
 		echo "==> [rtl-all] 存在失败模型 (见上方输出)"; exit 1; \
+	fi
+
+# Verilator lint：检查当前模型生成的 RTL, 报告写到 $(MODEL_OUT)/lint_report.txt
+lint: rtl
+	@bash scripts/lint_rtl.sh --rtl $(MODEL_OUT)/rtl --report $(MODEL_OUT)/lint_report.txt
+
+# 对 examples/ 全部模型逐个 lint（来源发现同 rtl-all）
+lint-all:
+	@set -e; \
+	fail=0; n=0; \
+	for m in $$(for d in examples/*/; do \
+	  d=$${d%/}; src=""; \
+	  [ -f "$$d/model.yaml" ] && [ -f "$$d/weights.npz" ] && src="$$d/model.yaml"; \
+	  [ -z "$$src" ] && [ -f "$$d/model.safetensors" ] && src="$$d/model.safetensors"; \
+	  [ -z "$$src" ] && [ -f "$$d/model.onnx" ] && src="$$d/model.onnx"; \
+	  [ -z "$$src" ] && [ -f "$$d/model.bin" ] && [ -f "$$d/model.yaml" ] && src="$$d/model.bin"; \
+	  [ -n "$$src" ] && echo "$$src"; \
+	done | sort); do \
+	  n=$$((n+1)); \
+	  echo ""; echo "=========== [lint-all] $$m ==========="; \
+	  $(MAKE) lint MODEL="$$m" OUT="$(OUT)" || fail=1; \
+	done; \
+	echo ""; \
+	if [ "$$fail" -eq 0 ]; then \
+		echo "==> [lint-all] 全部 $$n 个模型 LINT 通过"; \
+	else \
+		echo "==> [lint-all] 存在失败模型 (见上方输出)"; exit 1; \
 	fi
 
 # 测试套件
