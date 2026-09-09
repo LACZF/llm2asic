@@ -11,7 +11,7 @@
 #                   #   BACKEND=asic PDK=sky130hd LIBERTY=xxx.lib -> 标准单元网表
 #   make gds        # 一键：RTL -> OpenROAD flow -> 最终 GDS
 #                   #   依赖以 make rtl 生成 RTL(源码模型见 MODEL/OUT)
-#                   #   默认 MODEL=examples/gpt2_tiny/model.yaml OUT=build_gds；
+#                   #   默认 MODEL=examples/gpt2_tiny/model.yaml OUT=build；
 #                   #   其它模型如 llama_tiny 用
 #                   #     make gds MODEL=examples/llama_tiny/model.yaml OUT=build_llama
 #                   #   GDS_SKIP_DRT=0|1   1(默认)跳过详细布线省内存
@@ -25,7 +25,7 @@
 PYTHON     ?= python3
 PYTHONPATH := .
 MODEL      ?= examples/gpt2_tiny/model.yaml
-OUT        ?= build_gds
+OUT        ?= build
 # 每个模型按目录名归类: 所有产物(rtl/报告/综合/GDS)输出到 $(OUT)/<模型名>/
 NAME      := $(shell basename $(dir $(MODEL)))
 MODEL_OUT := $(OUT)/$(NAME)
@@ -64,7 +64,7 @@ help:
 	@echo ""
 	@echo "常用变量:"
 	@echo "  MODEL=路径      模型 YAML (默认 examples/gpt2_tiny/model.yaml)"
-	@echo "  OUT=目录        输出根目录 (默认 build_gds; 各模型在其下按名分类)"
+	@echo "  OUT=目录        输出根目录 (默认 build; 各模型在其下按名分类)"
 	@echo "  SINGLE=1        额外输出单文件 RTL"
 	@echo "  GDS_PLATFORM=   GDS 目标 PDK (默认 sky130hd)"
 	@echo "  GDS_SKIP_DRT=1  1=跳过详细布线省内存 (默认)"

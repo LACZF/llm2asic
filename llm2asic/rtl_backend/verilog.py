@@ -30,6 +30,35 @@ def _san(k: str) -> str:
     return k.replace(".", "_").replace("-", "_")
 
 
+def _hex_patterns(vals, bits: int = 24) -> list:
+    """把整数值转成与 .mem 相同的位模式 hex 词（写 ROM 时 `v & mask` 截位，
+    与 $readmemh 装载语义完全一致：越界值(如 recip 的 2^24)同样被截位）。"""
+    nhex = (bits + 3) // 4
+    return [f"{int(v) & ((1 << bits) - 1):0{nhex}x}" for v in vals]
+
+
+def _case_rom_fn(name: str, tokens, out_bits: int = 24,
+                 indent: str = "  ") -> str:
+    """生成可综合的 case 常量 ROM 函数（无 initial/$readmemh）。
+
+    任意综合器(DC/Genus/Vivado/Yosys/Verilator)都能综合的常数表：
+    `function ... name(input logic [A-1:0] a); case (a) idx: name=<const>;
+    ... default: name=0; endcase endfunction`。tokens 为位模式 hex 词，
+    与 .mem 文件逐位一致（截位/符号语义与 $readmemh 装载完全相同）。
+    """
+    n = len(tokens)
+    abits = max(1, (n - 1).bit_length())
+    head = (f"{indent}function automatic logic signed [{out_bits - 1}:0] {name}"
+            f"(input logic [{abits - 1}:0] a);")
+    lines = [head, f"{indent}  case (a)"]
+    for i, t in enumerate(tokens):
+        lines.append(f"{indent}    {i}: {name} = {out_bits}'h{t};")
+    lines.append(f"{indent}    default: {name} = {out_bits}'h0;")
+    lines.append(f"{indent}  endcase")
+    lines.append(f"{indent}endfunction")
+    return "\n".join(lines)
+
+
 def _precompute_rope_cs(cfg: dict) -> tuple:
     hd = cfg["head_dim"]
     seq = cfg["max_seq_len"]
@@ -57,8 +86,8 @@ _RR_FN = r"""
 
 GEMV_TEMPLATE = r'''
 // gemv：顺序 GEMV。x 打包输入，yout 打包输出。
-// ROM 文件名以字面量硬编码（Yosys 不支持 string 类型参数），故每个引擎
-// 输出独立文件 gemv_<idx>.sv 且模块名唯一。
+// 权重/尺度以 case 常量 ROM 函数内联（无 initial/$readmemh），
+// 任意综合器可综合；每个引擎独立文件 gemv_<idx>.sv。
 module @@GMOD@@ #(
   parameter C_IN=16, parameter C_OUT=16, parameter SIMD=8, parameter WW=4,
   parameter ACT=24, parameter RS=16, parameter WORDS=32, parameter NUM_BITS=24
@@ -69,16 +98,18 @@ module @@GMOD@@ #(
   output logic done
 );
 @@RRFN@@
+  // ---------- 权重 / 尺度 ROM（case 常量函数）----------
+@@WROM_FN@@
+@@NROM_FN@@
   localparam WPR = (C_IN + SIMD - 1) / SIMD;
-  logic [WW*SIMD-1:0] wrom [0:WORDS-1];
-  logic [NUM_BITS-1:0] nrom [0:C_OUT-1];
-  initial begin $readmemh("@@WF@@", wrom); $readmemh("@@SF@@", nrom); end
 
   function automatic logic signed [63:0] chunk_mac(input int oo, input int cc);
     integer j; logic signed [31:0] w; logic signed [63:0] p;
+    logic signed [WW*SIMD-1:0] wi;
     p = 0;
     for (j=0;j<SIMD;j=j+1) begin
-      w = $signed({ {32-WW{ wrom[oo*WPR+cc][j*WW+WW-1] }}, wrom[oo*WPR+cc][j*WW +: WW] });
+      wi = wrom_lut(oo*WPR+cc);
+      w = $signed({ {32-WW{ wi[j*WW+WW-1] }}, wi[j*WW +: WW] });
       p = p + w * $signed(x[(cc*SIMD+j)*ACT +: ACT]);
     end
     chunk_mac = p;
@@ -99,7 +130,7 @@ module @@GMOD@@ #(
           if (ch==WPR-1) st<=S_REQ; else ch<=ch+1;
         end
         S_REQ: begin
-          yout[o*ACT +: ACT] <= rr(acc*$signed({ {64-NUM_BITS{1'b0}}, nrom[o]}), RS);
+          yout[o*ACT +: ACT] <= rr(acc*$signed({ {64-NUM_BITS{1'b0}}, nrom_lut(o)}), RS);
           if (o==C_OUT-1) begin st<=S_IDLE; done<=1; end
           else begin o<=o+1; ch<=0; acc<=0; st<=S_MAC; end
         end
@@ -111,6 +142,7 @@ endmodule
 
 GEMV_TEMPLATE_BIAS = r'''
 // gemv + bias（GPT-2）：yout[o] = clamp( rr(acc*num, RS) + bias_rom[o] )。
+// 权重/尺度/bias 以 case 常量 ROM 函数内联（无 initial/$readmemh）。
 module @@GMOD@@ #(
   parameter C_IN=16, parameter C_OUT=16, parameter SIMD=8, parameter WW=4,
   parameter ACT=24, parameter RS=16, parameter WORDS=32, parameter NUM_BITS=24
@@ -121,18 +153,19 @@ module @@GMOD@@ #(
   output logic done
 );
 @@RRFN@@
+  // ---------- 权重 / 尺度 / bias ROM（case 常量函数）----------
+@@WROM_FN@@
+@@NROM_FN@@
+@@BROM_FN@@
   localparam WPR = (C_IN + SIMD - 1) / SIMD;
-  logic [WW*SIMD-1:0] wrom [0:WORDS-1];
-  logic [NUM_BITS-1:0] nrom [0:C_OUT-1];
-  logic signed [23:0] brom [0:C_OUT-1];
-  initial begin $readmemh("@@WF@@", wrom); $readmemh("@@SF@@", nrom);
-                  $readmemh("@@BF@@", brom); end
 
   function automatic logic signed [63:0] chunk_mac(input int oo, input int cc);
     integer j; logic signed [31:0] w; logic signed [63:0] p;
+    logic signed [WW*SIMD-1:0] wi;
     p = 0;
     for (j=0;j<SIMD;j=j+1) begin
-      w = $signed({ {32-WW{ wrom[oo*WPR+cc][j*WW+WW-1] }}, wrom[oo*WPR+cc][j*WW +: WW] });
+      wi = wrom_lut(oo*WPR+cc);
+      w = $signed({ {32-WW{ wi[j*WW+WW-1] }}, wi[j*WW +: WW] });
       p = p + w * $signed(x[(cc*SIMD+j)*ACT +: ACT]);
     end
     chunk_mac = p;
@@ -155,8 +188,8 @@ module @@GMOD@@ #(
         S_REQ: begin
           begin : bb
             logic signed [63:0] bv;
-            bv = rr(acc*$signed({ {64-NUM_BITS{1'b0}}, nrom[o]}), RS)
-                 + $signed(brom[o]);
+            bv = rr(acc*$signed({ {64-NUM_BITS{1'b0}}, nrom_lut(o)}), RS)
+                 + $signed(brom_lut(o));
             bv = (bv>64'sd8388607)?64'sd8388607:((bv<-64'sd8388608)?-64'sd8388608:bv);
             yout[o*ACT +: ACT] <= bv[ACT-1:0];
           end
@@ -186,8 +219,8 @@ module rmsnorm #(parameter H=16, ACT=24, F=12)(
     end
   end
   localparam RMX=@@RSQRT_MAX@@;
-  logic signed [23:0] rsqrt_mem [0:RMX];
-  initial $readmemh("rsqrt.mem", rsqrt_mem);
+  // ---------- rsqrt LUT（case 常量函数，可综合）----------
+@@RSQRT_FN@@
 
   logic signed [63:0] rsum;
   logic signed [23:0] c;
@@ -211,7 +244,7 @@ module rmsnorm #(parameter H=16, ACT=24, F=12)(
             logic signed [63:0] mean, idx;
             mean = (rsum + (H/2)) / H + 2;
             idx = (mean<1) ? 1 : (mean>RMX) ? RMX : mean;
-            c <= $signed(rsqrt_mem[idx[@@RSQRT_IDX@@:0]]);
+            c <= $signed(rsqrt_lut(idx[@@RSQRT_IDX@@:0]));
           end
           ii<=0; st<=SELEM;
         end
@@ -247,8 +280,8 @@ module layernorm #(parameter H=16, ACT=24, F=12)(
     end
   end
   localparam RMX=@@RSQRT_MAX@@;
-  logic signed [23:0] rsqrt_mem [0:RMX];
-  initial $readmemh("rsqrt.mem", rsqrt_mem);
+  // ---------- rsqrt LUT（case 常量函数，可综合）----------
+@@RSQRT_FN@@
 
   logic signed [63:0] rsum, rsumc, meanv;
   logic signed [23:0] c;
@@ -284,7 +317,7 @@ module layernorm #(parameter H=16, ACT=24, F=12)(
             end
             idx = (s2 + (H/2)) / H + 1;
             idx = (idx<1) ? 1 : ((idx>RMX) ? RMX : idx);
-            c <= $signed(rsqrt_mem[idx[@@RSQRT_IDX@@:0]]);
+            c <= $signed(rsqrt_lut(idx[@@RSQRT_IDX@@:0]));
           end
           ii<=0; st<=SELEM;
         end
@@ -328,10 +361,11 @@ module attn #(parameter H=16, HEADS=4, HD=4, SEQ=8, ACT=24, F=12, EF=10, RR=24, 
       end
     end
   end
-  logic signed [23:0] expneg_mem [0:@@EXPMAX@@];
-  logic signed [23:0] recip_mem  [0:@@RECMAX@@];
-  initial $readmemh("exp_neg.mem", expneg_mem);
-  initial $readmemh("recip.mem", recip_mem);
+  // ---------- exp(-x) / 1/x LUT（case 常量函数，可综合）----------
+  localparam EXPMAX=@@EXPMAX@@;
+  localparam RECMAX=@@RECMAX@@;
+@@EXP_FN@@
+@@RECIP_FN@@
 
   function automatic logic signed [63:0] banker(input logic signed [63:0] v, input int k);
     logic signed [63:0] q, rem;
@@ -377,8 +411,8 @@ module attn #(parameter H=16, HEADS=4, HD=4, SEQ=8, ACT=24, F=12, EF=10, RR=24, 
               logic signed [63:0] d;
               d = me - sc[p];
               d = (d<0) ? 0 : ((d>@@EXPMAX@@) ? @@EXPMAX@@ : d);
-              e[p]   <= expneg_mem[d[15:0]];
-              ssum   <= ssum + $signed(expneg_mem[d[15:0]]);
+              e[p]   <= expneg_lut(d[15:0]);
+              ssum   <= ssum + $signed(expneg_lut(d[15:0]));
             end
           end
           if (p==seq-1) st<=ANORM; else p<=p+1;
@@ -387,7 +421,7 @@ module attn #(parameter H=16, HEADS=4, HD=4, SEQ=8, ACT=24, F=12, EF=10, RR=24, 
           begin : rn
             logic signed [63:0] sid;
             sid = (ssum<1) ? 1 : ((ssum>@@RECMAX@@) ? @@RECMAX@@ : ssum);
-            rcp <= $signed(recip_mem[sid[15:0]]);
+            rcp <= $signed(recip_lut(sid[15:0]));
           end
           i<=0; st<=AOUT;
         end
@@ -452,7 +486,7 @@ def _build_master(engine_list, cfg):
 
     # ---------- S_DEC ----------
     emit("S_DEC",
-         f"for(int i=0;i<H;i=i+1) h[i]<=embed_rom[token_ram[tokk]*H+i]; "
+         f"for(int i=0;i<H;i=i+1) h[i]<=wte_lut(token_ram[tokk]*H+i); "
          f"S<={sn['R00']};")
 
     def gemv_en_wait(st_en, idx, st_done_next):
@@ -586,23 +620,18 @@ module @@MODNAME@@ #(
   // token 位置（master 维护）
   reg [15:0] tokk;
 
-  // ---------- 嵌入 ROM ----------
-  logic signed [23:0] embed_rom [0:VOCAB*H-1];
-  initial $readmemh("wte_q.mem", embed_rom);
+  // ---------- 嵌入 ROM（case 常量函数，可综合）----------
+@@WTE_FN@@
 
   // ---------- gamma ROM ----------
 @@GAMMA_ROMS@@
 
-  // ---------- silu LUT ----------
+  // ---------- silu LUT（case 常量函数）----------
   localparam SILU_LO=@@SILU_LO@@;
-  logic signed [23:0] silu_mem [0:@@SILU_SPAN@@];
-  initial $readmemh("silu.mem", silu_mem);
+@@SILU_FN@@
 
-  // ---------- rope cos/sin 常量 ----------
-  logic signed [23:0] rope_c [0:SEQ*HD/2 -1];
-  logic signed [23:0] rope_s [0:SEQ*HD/2 -1];
-@@ROPE_CINIT@@
-@@ROPE_SINIT@@
+  // ---------- rope cos/sin 常量（case 常量函数）----------
+@@ROPE_FNS@@
 
   // ---------- gemv 实例 ----------
 @@GEMV_DECLS@@
@@ -655,8 +684,8 @@ module @@MODNAME@@ #(
     logic signed [63:0] ar, br, tr, tc, cc, ss;
     for (int start=0; start<H; start=start+HD)
       for (int j=0;j<HD/2;j=j+1) begin
-        cc = rope_c[tokk*(HD/2)+j];
-        ss = rope_s[tokk*(HD/2)+j];
+        cc = rope_c_lut(tokk*(HD/2)+j);
+        ss = rope_s_lut(tokk*(HD/2)+j);
         ar = $signed(qvec[start+j]); br = $signed(qvec[start+j+HD/2]);
         tr = (ar*cc - br*ss + (1 <<< (F-1))) >>> F;
         tc = (tr>64'sd8388607)?64'sd8388607:((tr<-64'sd8388608)?-64'sd8388608:tr);
@@ -683,7 +712,7 @@ module @@MODNAME@@ #(
         xi = $signed(uvec[i]);
         xi = (xi<SILU_LO) ? SILU_LO : ((xi>@@SILU_HI@@) ? @@SILU_HI@@ : xi);
         sidx = xi - SILU_LO;
-        u  = silu_mem[sidx];
+        u  = silu_lut(sidx);
         us[i] = u;
       end
       begin : mb
@@ -770,21 +799,26 @@ def _emit_top(qmodel, cfg: dict) -> str:
         _latch_blocks.append("  always_ff @(posedge clk) begin " + " ".join(parts) + " end")
     gemv_latch = _latch_blocks
 
-    # gamma roms
-    gamma_roms = "\n".join(
-        f"  logic signed [23:0] {_san(k)}_g [0:{int(v.size)-1}];\n"
-        f"  initial $readmemh(\"{_san(k)}.mem\", {_san(k)}_g);"
+    # gamma ROMs（case 常量函数，可综合）
+    gamma_fns = "\n".join(
+        _case_rom_fn(f"{_san(k)}_g_lut", _hex_patterns(v.reshape(-1)))
         for k, v in qmodel.gammas.items())
 
-    # rope cos/sin init
+    # rope cos/sin 常量函数
     cq, sq = _precompute_rope_cs(cfg)
     nc = SEQ * (HD // 2)
-    def _f(v):
-        return f"-24'sd{abs(v)}" if v < 0 else f"24'sd{v}"
-    rope_cinit = "\n".join(
-        f"  rope_c[{x}] = {_f(cq[x//(HD//2)][x%(HD//2)])};" for x in range(nc))
-    rope_sinit = "\n".join(
-        f"  rope_s[{x}] = {_f(sq[x//(HD//2)][x%(HD//2)])};" for x in range(nc))
+    rope_fns = "\n".join([
+        _case_rom_fn("rope_c_lut",
+                     _hex_patterns([cq[x // (HD // 2)][x % (HD // 2)]
+                                    for x in range(nc)])),
+        _case_rom_fn("rope_s_lut",
+                     _hex_patterns([sq[x // (HD // 2)][x % (HD // 2)]
+                                    for x in range(nc)])),
+    ])
+
+    # wte / silu 常量函数
+    wte_fn = _case_rom_fn("wte_lut", _hex_patterns(qmodel.wte_q.reshape(-1)))
+    silu_fn = _case_rom_fn("silu_lut", _hex_patterns(qmodel.luts.silu_gate))
 
     # rms_gin gamma select case
     rms_gsel = []
@@ -796,7 +830,8 @@ def _emit_top(qmodel, cfg: dict) -> str:
     for gi, gk in enumerate(norm_keys):
         arr = qmodel.gammas[gk]
         body = " ".join(
-            f"rms_gin[{i}*{ACTW} +: {ACTW}] = {_san(gk)}_g[{i}];" for i in range(H))
+            f"rms_gin[{i}*{ACTW} +: {ACTW}] = {_san(gk)}_g_lut({i});"
+            for i in range(H))
         rms_gsel.append(f"      {gi}: begin {body} end")
     rms_gsel = "\n".join(rms_gsel)
 
@@ -816,9 +851,10 @@ def _emit_top(qmodel, cfg: dict) -> str:
     lo = -(1 << (qmodel.luts.silu_input_bits - 1))
     hi = (1 << (qmodel.luts.silu_input_bits - 1)) - 1
     r = r.replace("@@SILU_SPAN@@", str(hi - lo))
-    r = r.replace("@@GAMMA_ROMS@@", gamma_roms)
-    r = r.replace("@@ROPE_CINIT@@", "  initial begin\n" + rope_cinit + "\n  end")
-    r = r.replace("@@ROPE_SINIT@@", "  initial begin\n" + rope_sinit + "\n  end")
+    r = r.replace("@@GAMMA_ROMS@@", gamma_fns)
+    r = r.replace("@@ROPE_FNS@@", rope_fns)
+    r = r.replace("@@WTE_FN@@", wte_fn)
+    r = r.replace("@@SILU_FN@@", silu_fn)
     r = r.replace("@@GEMV_DECLS@@", "\n".join(gemv_decls))
     r = r.replace("@@GEMV_INSTS@@", "\n".join(gemv_insts))
     r = r.replace("@@GEMV_DRIVES@@", "\n".join(gemv_drives))
@@ -871,7 +907,7 @@ def _build_master_gpt2(engine_list, cfg):
     # 位置嵌入：h[i] = embed_rom[token] + wpe_rom[tokk*H+i]
     emit("S_DEC",
          f"for(int i=0;i<H;i=i+1) h[i]<="
-         f"$signed(embed_rom[token_ram[tokk]*H+i])+$signed(wpe_rom[tokk*H+i]); "
+         f"$signed(wte_lut(token_ram[tokk]*H+i))+$signed(wpe_lut(tokk*H+i)); "
          f"S<={sn['R00']};")
 
     def gemv_en_wait(st_en, idx, st_done_next):
@@ -918,7 +954,7 @@ def _build_master_gpt2(engine_list, cfg):
                         f"logic signed [63:0] xi; integer sidx; "
                         f"xi=$signed(fcvec[i]); "
                         f"xi=(xi<GELU_LO)?GELU_LO:((xi>GELU_HI)?GELU_HI:xi); "
-                        f"sidx=xi-GELU_LO; gvec[i]<=gelu_mem[sidx]; "
+                        f"sidx=xi-GELU_LO; gvec[i]<=gelu_lut(sidx); "
                         f"end S<={sn[f'pr{L}']};"))
         gemv_en_wait(f"pr{L}", idx_of(f"{L}.proj"), f"AHH{L}")
         nl = nxt_after_layer(L)
@@ -996,20 +1032,18 @@ module @@MODNAME@@ #(
   logic signed [ACT-1:0] kv_v [0:LYR-1][0:SEQ-1][0:H-1];
   reg [15:0] tokk;
 
-  // ---------- 嵌入 + 位置嵌入 ROM ----------
-  logic signed [23:0] embed_rom [0:VOCAB*H-1];
-  initial $readmemh("wte_q.mem", embed_rom);
-  logic signed [23:0] wpe_rom [0:SEQ*H-1];
-  initial $readmemh("wpe_q.mem", wpe_rom);
+  // ---------- 嵌入 + 位置嵌入 ROM（case 常量函数，可综合）----------
+@@WTE_FN@@
+@@WPE_FN@@
 
-  // ---------- 归一化（gamma/beta）ROM ----------
+  // ---------- 归一化（gamma/beta）ROM（case 常量函数）----------
 @@NORM_ROMS@@
 
   // ---------- gelu LUT ----------
   localparam GELU_LO=@@GELU_LO@@;
   localparam GELU_HI=@@GELU_HI@@;
-  logic signed [23:0] gelu_mem [0:@@GELU_SPAN@@];
-  initial $readmemh("gelu.mem", gelu_mem);
+  // ---------- gelu LUT（case 常量函数）----------
+@@GELU_FN@@
 
   // ---------- gemv 实例 ----------
 @@GEMV_DECLS@@
@@ -1141,10 +1175,12 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
         norm_keys += [f'layers.{L}.ln_1.gamma', f'layers.{L}.ln_1.beta',
                       f'layers.{L}.ln_2.gamma', f'layers.{L}.ln_2.beta']
     norm_keys += ['final_norm.gamma', 'final_norm.beta']
-    norm_roms = "\n".join(
-        f"  logic signed [23:0] {_san(k)}_g [0:{int(v.size)-1}];\n"
-        f"  initial $readmemh(\"{_san(k)}.mem\", {_san(k)}_g);"
+    norm_fns = "\n".join(
+        _case_rom_fn(f"{_san(k)}_g_lut", _hex_patterns(v.reshape(-1)))
         for k, v in qmodel.gammas.items())
+    wte_fn = _case_rom_fn("wte_lut", _hex_patterns(qmodel.wte_q.reshape(-1)))
+    wpe_fn = _case_rom_fn("wpe_lut", _hex_patterns(qmodel.wpe_q.reshape(-1)))
+    gelu_fn = _case_rom_fn("gelu_lut", _hex_patterns(qmodel.luts.gelu))
 
     # gamma / beta 选择器
     def _sel(suffix):
@@ -1153,7 +1189,7 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
             if not gk.endswith(suffix):
                 continue
             tgt = 'ln_gin' if suffix == 'gamma' else 'ln_bin'
-            body = " ".join(f"{tgt}[{j}*{ACTW} +: {ACTW}] = {_san(gk)}_g[{j}];"
+            body = " ".join(f"{tgt}[{j}*{ACTW} +: {ACTW}] = {_san(gk)}_g_lut({j});"
                             for j in range(H))
             rows.append(f"      {gi}: begin {body} end")
         return "\n".join(rows)
@@ -1176,7 +1212,10 @@ def _emit_top_gpt2(qmodel, cfg: dict) -> str:
     }
     for k, v in repl.items():
         r = r.replace(f"@@{k}@@", str(v))
-    r = r.replace("@@NORM_ROMS@@", norm_roms)
+    r = r.replace("@@NORM_ROMS@@", norm_fns)
+    r = r.replace("@@WTE_FN@@", wte_fn)
+    r = r.replace("@@WPE_FN@@", wpe_fn)
+    r = r.replace("@@GELU_FN@@", gelu_fn)
     r = r.replace("@@LN_GSEL@@", ln_gsel)
     r = r.replace("@@LN_BSEL@@", ln_bsel)
     r = r.replace("@@GEMV_DECLS@@", "\n".join(gemv_decls))
@@ -1248,12 +1287,19 @@ endmodule
 def _fill_module(s: str, qmodel, **kw) -> str:
     for k, v in kw.items():
         s = s.replace("@@" + k + "@@", str(v))
-    rsqrt_idx = (qmodel.luts.rsqrt.shape[0] - 1).bit_length() - 1
-    return (s.replace("@@RSQRT_MAX@@", str(qmodel.luts.rsqrt.shape[0] - 1))
+    luts = qmodel.luts
+    rsqrt_idx = (luts.rsqrt.shape[0] - 1).bit_length() - 1
+    rsqrt_fn = _case_rom_fn("rsqrt_lut", _hex_patterns(luts.rsqrt))
+    exp_fn = _case_rom_fn("expneg_lut", _hex_patterns(luts.exp_neg))
+    recip_fn = _case_rom_fn("recip_lut", _hex_patterns(luts.recip2))
+    return (s.replace("@@RSQRT_MAX@@", str(luts.rsqrt.shape[0] - 1))
              .replace("@@RSQRT_IDX@@", str(rsqrt_idx))
-             .replace("@@EXPMAX@@", str(qmodel.luts.exp_neg.shape[0] - 1))
-             .replace("@@RECMAX@@", str(qmodel.luts.recip2.shape[0] - 1))
-             .replace("@@RRFN@@", _RR_FN.strip()))
+             .replace("@@EXPMAX@@", str(luts.exp_neg.shape[0] - 1))
+             .replace("@@RECMAX@@", str(luts.recip2.shape[0] - 1))
+             .replace("@@RRFN@@", _RR_FN.strip())
+             .replace("@@RSQRT_FN@@", rsqrt_fn)
+             .replace("@@EXP_FN@@", exp_fn)
+             .replace("@@RECIP_FN@@", recip_fn))
 
 
 def _write_idem(path: str, content: str) -> bool:
@@ -1265,9 +1311,16 @@ def _write_idem(path: str, content: str) -> bool:
     return True
 
 
+def _read_hex_tokens(path: str) -> list:
+    """读取 .mem 文件每行的 hex 词（wrom/nrom/brom 只取自量化产物，
+    与 $readmemh 时代逐位等价）。"""
+    with open(path, "r", encoding="utf-8") as f:
+        return [ln.strip() for ln in f if ln.strip()]
+
+
 def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
              backend_dir: str = "rtl", single_file: bool = False) -> str:
-    """生成 RTL 文件到 out_dir/rtl。返回顶层模块名。返回主 .sv 路径。"""
+    """生成 RTL 文件到 out_dir/rtl。返回顶层模块名。"""
     modname = f"{cfg['name']}_accel"
     rdir = os.path.join(out_dir, backend_dir)
     os.makedirs(rdir, exist_ok=True)
@@ -1275,20 +1328,39 @@ def generate(qmodel, cfg: dict, out_dir: str, tokens: np.ndarray,
     is_gpt2 = cfg.get("architecture") == "gpt2"
     top = _emit_top_gpt2(qmodel, cfg) if is_gpt2 else _emit_top(qmodel, cfg)
 
+    # gemv 权重/尺度/偏置：从量化产物 .mem 取数，内联为 case 常量函数。
+    # （不再用 $readmemh；同一份 hex 词保证与解析器/黄金参考逐位一致。）
+    wrom_dir = os.path.join(out_dir, "quantizer", "weights_rom")
+    if not os.path.isdir(wrom_dir):
+        raise FileNotFoundError(
+            f"未找到量化产物目录 {wrom_dir}，无法生成可综合权重 ROM")
+
     # 每个 gemv 引擎一个独立模块（文件名硬编码，兼容 Yosys）
     engine_list = sorted(qmodel.engines.items())
     gemv_files = {}
+    simd = qmodel.simd
+    ww = qmodel.bit_width
     for idx, (key, qw) in enumerate(engine_list):
+        wrom_fn = _case_rom_fn(
+            "wrom_lut", _read_hex_tokens(os.path.join(wrom_dir, qw.rom_file)),
+            out_bits=ww * simd)
+        nrom_fn = _case_rom_fn(
+            "nrom_lut",
+            _read_hex_tokens(os.path.join(wrom_dir, qw.scale_rom_file)),
+            out_bits=24)
         has_bias = getattr(qw, "bias_q", None) is not None
         if is_gpt2 and has_bias:
+            brom_fn = _case_rom_fn(
+                "brom_lut",
+                _read_hex_tokens(os.path.join(wrom_dir, qw.bias_rom_file)))
             gemv_tpl = GEMV_TEMPLATE_BIAS
-            g2_kw = dict(BF=qw.bias_rom_file or f"{_san(key)}_bias.mem")
         else:
+            brom_fn = ""
             gemv_tpl = GEMV_TEMPLATE
-            g2_kw = {}
         gemv_files[f"gemv_{idx}.sv"] = _fill_module(
             gemv_tpl, qmodel,
-            GMOD=f"gemv_{idx}", WF=qw.rom_file, SF=qw.scale_rom_file, **g2_kw)
+            GMOD=f"gemv_{idx}",
+            WROM_FN=wrom_fn, NROM_FN=nrom_fn, BROM_FN=brom_fn)
 
     files = {
         f"{modname}.sv": top,
