@@ -219,6 +219,10 @@ module rmsnorm #(parameter H=16, ACT=24, F=12)(
     end
   end
   localparam RMX=@@RSQRT_MAX@@;
+  // H 为 2 的幂时用算术右移实现「÷H」（穷举一致，且不产生 $div 除法器）；
+  // 否则保留除法表达式（当前全部模型 H∈{8,16}，综合器恒折叠为移位）。
+  localparam HAS_SHIFT = (H & (H - 1)) == 0;
+  localparam HSH = HAS_SHIFT ? $clog2(H) : 0;
   // ---------- rsqrt LUT（case 常量函数，可综合）----------
 @@RSQRT_FN@@
 
@@ -242,7 +246,8 @@ module rmsnorm #(parameter H=16, ACT=24, F=12)(
         SMEAN: begin
           begin : um
             logic signed [63:0] mean, idx;
-            mean = (rsum + (H/2)) / H + 2;
+            mean = (HAS_SHIFT ? ((rsum + (H/2)) >>> HSH)
+                              : ((rsum + (H/2)) / H)) + 2;
             idx = (mean<1) ? 1 : (mean>RMX) ? RMX : mean;
             c <= $signed(rsqrt_lut(idx[@@RSQRT_IDX@@:0]));
           end
@@ -280,6 +285,10 @@ module layernorm #(parameter H=16, ACT=24, F=12)(
     end
   end
   localparam RMX=@@RSQRT_MAX@@;
+  // H 为 2 的幂时用算术右移实现「÷H」（穷举一致，且不产生 $div 除法器）；
+  // 否则保留除法表达式（当前全部模型 H∈{8,16}，综合器恒折叠为移位）。
+  localparam HAS_SHIFT = (H & (H - 1)) == 0;
+  localparam HSH = HAS_SHIFT ? $clog2(H) : 0;
   // ---------- rsqrt LUT（case 常量函数，可综合）----------
 @@RSQRT_FN@@
 
@@ -302,7 +311,8 @@ module layernorm #(parameter H=16, ACT=24, F=12)(
             begin : mn
               logic signed [63:0] nsum;
               nsum = rsum + $signed(xa[ii]) + (H/2);
-              meanv <= (nsum>=0) ? (nsum / H) : ((nsum - (H - 1)) / H);
+              meanv <= HAS_SHIFT ? (nsum >>> HSH)
+                    : ((nsum>=0) ? (nsum / H) : ((nsum - (H - 1)) / H));
             end
             st<=SMEAN;
           end else ii<=ii+1;
@@ -315,7 +325,8 @@ module layernorm #(parameter H=16, ACT=24, F=12)(
               xc[j]<=$signed(xa[j])-meanv;
               s2=s2 + ($signed(xa[j])-meanv)*($signed(xa[j])-meanv);
             end
-            idx = (s2 + (H/2)) / H + 1;
+            idx = (HAS_SHIFT ? ((s2 + (H/2)) >>> HSH)
+                             : ((s2 + (H/2)) / H)) + 1;
             idx = (idx<1) ? 1 : ((idx>RMX) ? RMX : idx);
             c <= $signed(rsqrt_lut(idx[@@RSQRT_IDX@@:0]));
           end
