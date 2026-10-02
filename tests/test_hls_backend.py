@@ -11,6 +11,7 @@ native 路径只要有 g++ 就能跑，是这里的基准。
 """
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -34,6 +35,10 @@ from llm2asic.hls_backend.c_kernel import (
     gen_c_kernel,
 )
 from llm2asic.hls_backend.float_ref import ref_decode_step
+from llm2asic.hls_backend.verilog_synth import (
+    make_rom_synthesizable,
+    scan_simulation_only,
+)
 from llm2asic.parser.builder import run_from_path
 
 EXAMPLES = os.path.join(os.path.dirname(__file__), "..", "examples")
@@ -575,9 +580,10 @@ def test_bambu_stubs_missing_mem_files(tmp_path):
     assert [os.path.basename(p) for p in res.mem_stubbed] == ["array.mem"]
     stub_path = res.mem_stubbed[0]
     assert os.path.isfile(stub_path)
-    # data_size=8 -> 2 hex digit；n_elements=2 -> 两行
+    # Bambu 的存储体模板用 $readmemb，一个字符 = 1 bit，
+    # 所以占位必须是 8 个二进制 0（不是 2 个 hex digit）
     lines = open(stub_path).read().split()
-    assert lines == ["00", "00"]
+    assert lines == ["0" * 8, "0" * 8]
     assert any("占位" in w for w in res.warnings)
 
 
@@ -735,3 +741,198 @@ def test_run_yosys_check_stats_sum_all_modules(tmp_path):
     assert int(stats["wire_bits"]) == sum(_local(b, "wire bits")
                                          for b in blocks)
     assert int(stats["cells"]) >= 2        # 两个加法，不能被"只看顶层"抹成 1
+
+
+# ---------------------------------------------------------- ROM 合成化
+
+_REALISTIC_MEM = """module ARRAY_1D_STD_DISTRAM_NN_SDS #(
+  parameter data_size = 32,
+  parameter n_elements = 4,
+  parameter MEMORY_INIT_file = "array_ref_1.mem",
+  parameter READ_ONLY_MEMORY = 1
+) (
+  input wire clock,
+  input wire [31:0] memory_addr_a,
+  output reg [data_size-1:0] dout_a
+);
+  reg [data_size-1:0] memory [0:n_elements-1]/* synthesis syn_ramstyle = "no_rw_check" */;
+
+  initial
+  begin
+    if (MEMORY_INIT_file != "")
+      $readmemb(MEMORY_INIT_file, memory, 0, n_elements-1);
+    else
+    begin
+      for(integer i=0; i<n_elements; i=i+1)
+      begin
+        memory[i] = 0;
+      end
+    end
+  end
+
+  always @(posedge clock)
+  begin
+    if (READ_ONLY_MEMORY == 0)
+      memory[memory_addr_a] <= dout_a;
+    dout_a <= memory[memory_addr_a];
+  end
+endmodule
+"""
+
+
+def _write_mem(d, name, toks):
+    with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+        f.write("\n".join(toks) + "\n")
+
+
+def test_rom_rewrite_removes_initial_and_readmemb(tmp_path):
+    """initial/$readmemb 是仿真专用，必须换成常量 case。"""
+    v = tmp_path / "top.v"
+    v.write_text(_REALISTIC_MEM, encoding="utf-8")
+    _write_mem(str(tmp_path), "array_ref_1.mem",
+               ["00000000000000000000000000000001",
+                "11111111111111111111111111111110",
+                "10101010101010101010101010101011",
+                "00000000000000000000000000000000"])
+
+    res = make_rom_synthesizable(str(v), [str(tmp_path)])
+    assert res.readmem_removed == 1
+    assert res.reads_romified >= 1
+    assert res.files_baked == [os.path.join(str(tmp_path), "array_ref_1.mem")]
+    assert res.files_missing == []
+
+    text = v.read_text(encoding="utf-8")
+    assert scan_simulation_only(text) == {}
+    assert "$readmemb" not in text
+    # 数组声明必须原样保留（后面还跟着注释和分号）
+    assert 'reg [data_size-1:0] memory [0:n_elements-1]' in text
+    # 删 initial 块不能留下孤儿 end：嵌套 else/for 的 end 要成对吃掉。
+    # 必须按词计数，子串匹配会把 endmodule/endfunction 也算进去。
+    assert len(re.findall(r"\bbegin\b", text)) == len(re.findall(r"\bend\b", text))
+    # 逐位核对二进制初值
+    assert "llm2asic_rom_memory = 32'h1;" in text        # 0b...01
+    assert "llm2asic_rom_memory = 32'hfffffffe;" in text   # 0b...10
+    assert "llm2asic_rom_memory = 32'haaaaaaab;" in text   # 1010...1011
+
+
+def test_rom_rewrite_gates_reads_only_not_writes(tmp_path):
+    """写端和字节使能子写不能被换成查表，否则 RW 存储体行为变了。"""
+    v = tmp_path / "top.v"
+    v.write_text(_REALISTIC_MEM, encoding="utf-8")
+    _write_mem(str(tmp_path), "array_ref_1.mem", ["0" * 32] * 4)
+    make_rom_synthesizable(str(v), [str(tmp_path)])
+    text = v.read_text(encoding="utf-8")
+
+    # 读端被门控
+    assert "READ_ONLY_MEMORY ? llm2asic_rom_memory(" in text
+    # 写端仍是原样赋值
+    assert "memory[memory_addr_a] <= dout_a;" in text
+    gated_write = re.compile(
+        r"\(READ_ONLY_MEMORY \? llm2asic_rom_\w+\([^)]*\)"
+        r"\s*:\s*\w+\[[^\]]*\]\)\s*\[[^\]]*\]\s*<=")
+    assert not gated_write.search(text)
+
+
+def test_rom_rewrite_zero_fill_for_missing_mem(tmp_path):
+    """文件缺失或名为空时按全零 ROM 处理，宽度用声明表达式算对。"""
+    v = tmp_path / "top.v"
+    v.write_text(_REALISTIC_MEM, encoding="utf-8")
+    res = make_rom_synthesizable(str(v), [str(tmp_path)])
+    assert res.readmem_removed == 1
+    # 默认的 array_ref_1.mem 不存在：要如实报出来，并退化成全零 ROM
+    assert res.files_missing == ["array_ref_1.mem"]
+    assert res.files_baked == []
+    assert any("array_ref_1.mem" in w for w in res.warnings)
+    text = v.read_text(encoding="utf-8")
+    # 不能出现 {data_size-1:0{...}} 这种非法的复制宽度
+    assert "{data_size-1:0{" not in text
+    assert "{((data_size-1)-(0)+1){1'b0}}" in text
+
+
+def test_rom_rewrite_keeps_readmemh_hex_semantics(tmp_path):
+    """$readmemh 的每个字符是 4 bit，不能按二进制解析。"""
+    v = tmp_path / "h.v"
+    v.write_text("""module m #(
+  parameter data_size = 16,
+  parameter n_elements = 2,
+  parameter MEMORY_INIT_file = "h.mem",
+  parameter READ_ONLY_MEMORY = 1
+) (input wire clock, input wire [31:0] a, output reg [data_size-1:0] q);
+  reg [data_size-1:0] memory [0:n_elements-1];
+  initial begin
+    $readmemh(MEMORY_INIT_file, memory, 0, n_elements-1);
+  end
+  always @(posedge clock) q <= memory[a];
+endmodule
+""", encoding="utf-8")
+    _write_mem(str(tmp_path), "h.mem", ["abcd", "0001"])
+    make_rom_synthesizable(str(v), [str(tmp_path)])
+    text = v.read_text(encoding="utf-8")
+    assert "16'habcd" in text
+    assert "16'h1" in text        # 前导 0 不影响数值
+
+
+def test_scan_simulation_only_flags_residuals():
+    """收尾扫描要能报出没改掉的仿真专用构造。"""
+    assert scan_simulation_only("module m; endmodule\n") == {}
+    src = """module m (input c, input [3:0] a, output reg [3:0] q);
+  reg [3:0] mem [0:3];
+  initial begin $readmemh("f.mem", mem); end
+  always @(posedge c) q <= mem[a];
+endmodule
+"""
+    found = scan_simulation_only(src)
+    assert found.get("initial") == 1
+    assert found.get("readmem") == 1
+
+
+def test_run_bambu_synth_cleanup_off_keeps_initial(tmp_path):
+    """synth_cleanup=False 时不改写，initial 原样留着。"""
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir()
+    stub = bindir / "bambu"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo stub; exit 0; fi\n'
+        "printf '0000000000000001\\n' > array_ref_1.mem\n"
+        "cat > top.v <<'EOF'\n" + _REALISTIC_MEM.replace(
+            "module ARRAY_1D_STD_DISTRAM_NN_SDS",
+            "module ARRAY_1D_STD_DISTRAM_NN_SDS") + "EOF\n"
+        "exit 0\n")
+    stub.chmod(0o755)
+    src = tmp_path / "k.cpp"
+    src.write_text("void top(){}\n")
+
+    res = run_bambu(str(src), str(tmp_path / "w"), "top",
+                    BambuConfig(binary=str(stub), cwd_name="r_off",
+                                synth_cleanup=False))
+    assert res.ok, res.errors
+    assert res.rom_readmem_removed == 0
+    assert "$readmemb" in open(res.top_verilog, encoding="utf-8").read()
+
+
+def test_run_bambu_synth_cleanup_on_bakes_rom(tmp_path):
+    """默认开启：改写 + 报告固化结果，且残留构造为空。"""
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir()
+    stub = bindir / "bambu"
+    stub.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--version" ]; then echo stub; exit 0; fi\n'
+        "printf '00000000000000000000000000000001\\n' > array_ref_1.mem\n"
+        "cat > top.v <<'EOF'\n" + _REALISTIC_MEM + "EOF\n"
+        "exit 0\n")
+    stub.chmod(0o755)
+    src = tmp_path / "k.cpp"
+    src.write_text("void top(){}\n")
+
+    res = run_bambu(str(src), str(tmp_path / "w"), "top",
+                    BambuConfig(binary=str(stub), cwd_name="r_on"))
+    assert res.ok, res.errors
+    assert res.rom_readmem_removed == 1
+    assert [os.path.basename(p) for p in res.rom_files_baked] == ["array_ref_1.mem"]
+    assert res.unsynthesizable == {}
+    assert any("ROM 合成化改写" in w for w in res.warnings)
+    text = open(res.top_verilog, encoding="utf-8").read()
+    assert scan_simulation_only(text) == {}
+    assert "32'h1" in text

@@ -68,6 +68,9 @@ class HlsBambuConfig:
     simulate: bool = False
     simulator: str = "VERILATOR"
     mem_stub: bool = True            # 补齐 .v 引用但缺失的 .mem（全零占位）
+    # 把 Bambu 生成 Verilog 里的 initial/$readmemb 改写成常量 case ROM。
+    # 关掉就只剩占位 .mem，综合器依然读不到外部初始化数据。
+    synth_cleanup: bool = True
     timeout: int = 3600
 
 
@@ -206,6 +209,7 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
             simulate=bool(bambu_d.get("simulate", False)),
             simulator=str(bambu_d.get("simulator", "VERILATOR")),
             mem_stub=bool(bambu_d.get("mem_stub", True)),
+            synth_cleanup=bool(bambu_d.get("synth_cleanup", True)),
             timeout=int(bambu_d.get("timeout", 3600)),
         ),
     )

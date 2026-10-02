@@ -194,9 +194,81 @@ hls:
     link_libm: true           # -lm
     experimental_setup: ""    # 注意：自带 -O0，会覆盖 opt_level
     mem_stub: true            # 补齐缺失的 .mem（全零占位）
+    synth_cleanup: true       # initial/$readmemb -> 常量 case ROM
     evaluation: ""       # 如 PERIOD,AREA,REGISTERS,DSPS,BRAMS
     simulate: false
 ```
 
 缓冲池打满且没有可复用的空闲缓冲时会**直接报错**（而不是复用仍活跃的缓冲
 产出错误结果），此时调大 `n_buffers` 即可。
+
+### 可综合性：`initial` / `$readmemb`
+
+Bambu 生成的存储体模板（`ARRAY_1D_STD_DISTRAM_NN_SDS`、
+`STD_SP_BRAM`、`BRAM_MEMORY_CORE_SMALL` 等）都带这么一段：
+
+```verilog
+reg [data_size-1:0] memory [0:n_elements-1];
+initial
+begin
+  if (MEMORY_INIT_file != "")
+    $readmemb(MEMORY_INIT_file, memory, 0, n_elements-1);
+  else
+  begin
+    for(index=0; index<n_elements; index=index+1)
+    begin
+      memory[index] = 0;
+    end
+  end
+end
+```
+
+`initial` + `$readmemb` **只在仿真下有意义**：综合器不读外部 `.mem` 文件，
+ASIC 流程会直接报错，FPGA 流程则常常静默丢初值——于是权重全零，`check`
+照样过、`yosys` 照样过，只有对比仿真结果才发现数字不对。
+
+`synth_cleanup: true`（默认开）在 Bambu 出 RTL 之后、收 `.mem` 之前，把它
+就地改写成可综合的常量查表：
+
+```verilog
+function [data_size-1:0] llm2asic_rom_memory;
+  input [31:0] llm2asic_rom_addr;
+  begin
+    llm2asic_rom_memory = {((data_size-1)-(0)+1){1'b0}};   // 默认全零
+    if (MEMORY_INIT_file == "array_ref_30905.mem") begin
+      case (llm2asic_rom_addr)
+        0: llm2asic_rom_memory = 32'h1ffff;
+        1: llm2asic_rom_memory = 32'h1fe02;
+        ...
+      endcase
+    end
+  end
+endfunction
+```
+
+读端按只读标志分流，**写端和字节使能子写原样不动**：
+
+```verilog
+dout_a <= (READ_ONLY_MEMORY ? llm2asic_rom_memory(addr) : memory[addr]);
+```
+
+几点容易踩的地方，这里都处理了：
+
+- **`$readmemb` 一个字符 = 1 bit**，不是十六进制。`array_ref_30905.mem`
+  每行 32 个字符就是 32 bit，按 hex 解会得到 128 bit，数据全错。
+- 宽度从声明表达式推（`data_size-1:0`、`BITSIZE_data_out-1:0`、
+  `(n_byte_on_databus)*8-1:0`），不能当成常数写死。
+- 删 `initial` 必须成对匹配 `begin`/`end`。Bambu 的块里有嵌套
+  `else` + `for`，用非贪婪 `.*?end` 会停在 `for` 体的 `end`，留下一堆
+  孤儿 `end`，Yosys 直接语法错。
+- 数组声明末尾还跟着注释和分号（`reg [...] memory [0:n-1] /* ... */;`），
+  ROM 函数必须插在**声明之前**，插在声明和分号之间会截断声明。
+- 字节使能写是 `memory[a][i*8+:8] <= ...`，判断读/写要跳过尾随的位选，
+  否则会把写操作门控成查表，读写存储体行为就变了。
+- 找不到 `.mem` 时按全零 ROM 处理，并在 warnings 里点名——静默烤零正是
+  最难查的那种错。
+
+改写只动上面这些位置，其余字节不变。gpt2_tiny 实测：6 个存储体模板、
+8 个 `.mem`，Yosys `check` 干净（只剩 Bambu 本来就有的那条
+`OUT_UNBOUNDED_*` 无驱动告警），area/ff 与改写前一致（65956 / 21153），
+1312 个地址的查表结果与 `$readmemb` 逐位相同。

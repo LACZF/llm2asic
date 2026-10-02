@@ -151,6 +151,7 @@ def _hls(args) -> int:
         simulate=h.bambu.simulate,
         simulator=h.bambu.simulator,
         mem_stub=h.bambu.mem_stub,
+        synth_cleanup=h.bambu.synth_cleanup,
         timeout=h.bambu.timeout,
     )
     kcfg = CKernelConfig(precision=h.precision, n_buffers=h.n_buffers,

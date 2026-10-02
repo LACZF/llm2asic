@@ -19,7 +19,12 @@ import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+from .verilog_synth import (
+    make_rom_synthesizable,
+    scan_simulation_only,
+)
 
 __all__ = [
     "BambuConfig", "BambuResult", "bambu_version", "bambu_available",
@@ -61,6 +66,10 @@ class BambuConfig:
     # 生成的 .v 引用了不存在的 .mem 时（如 --simulate 的 array.mem），
     # 是否补一个全零占位文件，好让下游 Yosys 能展开。
     mem_stub: bool = True
+    # 把 initial/$readmemb 改写成可综合的常量 case ROM。Bambu 生成的
+    # 存储体模板一定带这段，只在仿真有效；综合器不读外部 .mem，
+    # ASIC 流程直接报错、FPGA 流程常静默丢初值。默认开。
+    synth_cleanup: bool = True
     extra_args: List[str] = field(default_factory=list)
     timeout: int = 3600
     cwd_name: str = "bambu_run"      # 工作目录名（相对 out_dir）
@@ -77,6 +86,10 @@ class BambuResult:
     top_verilog: str = ""            # <top>.v（Bambu 写在工作目录，不是 HLS_output/）
     mem_files: List[str] = field(default_factory=list)
     mem_stubbed: List[str] = field(default_factory=list)
+    # ROM 改写结果（initial/$readmemb -> 常量 case）
+    rom_files_baked: List[str] = field(default_factory=list)
+    rom_readmem_removed: int = 0
+    unsynthesizable: Dict[str, int] = field(default_factory=dict)
     top_module: str = ""
     # 报告指标（未找到时为 None）
     area: Optional[float] = None
@@ -323,6 +336,20 @@ def _find_design_verilog(work: str, top: str) -> List[str]:
     return sorted(set(hits))
 
 
+def _mem_refs_for_stub(text: str) -> List[str]:
+    """只把**仍被 $readmem 引用**的 .mem 当作需要补占位的目标。
+
+    ROM 改写之后 .mem 名只会出现在 ``if (MEMORY_INIT_file == "x.mem")``
+    这种字符串比较里，数据已经烤进常量表，再补占位只会误导。
+    """
+    names: List[str] = []
+    for c in re.findall(r"\$readmem[hb]?\s*\([^;]*?\)", text):
+        for n in re.findall(r'"([^"]+)"', c):
+            if n not in names:
+                names.append(n)
+    return names
+
+
 def _mem_geometry(verilog_text: str, mem_name: str):
     """推断某个 MEMORY_INIT_file 对应存储器的 (n_elements, data_size)。
 
@@ -348,10 +375,11 @@ def _collect_mem(work: str, verilog: List[str], create_stub: bool):
     text = ""
     for v in verilog:
         text += _read(v)
-    refs: List[str] = []
-    for m in _MEM_REF_RE.finditer(text):
-        if m.group(1) not in refs:
-            refs.append(m.group(1))
+    refs = _mem_refs_for_stub(text)
+    if not refs:
+        for m in _MEM_REF_RE.finditer(text):
+            if m.group(1) not in refs:
+                refs.append(m.group(1))
 
     found: List[str] = []
     stubbed: List[str] = []
@@ -366,8 +394,9 @@ def _collect_mem(work: str, verilog: List[str], create_stub: bool):
         n, width = geo if geo else (1, 32)
         try:
             os.makedirs(os.path.dirname(p) or work, exist_ok=True)
+            # $readmemb 一个字符 = 1 bit，占位必须写二进制全 0
             with open(p, "w", encoding="utf-8") as f:
-                f.write((f"{0:0{(width + 3) // 4}x}\n") * n)
+                f.write(("0" * max(width, 1) + "\n") * n)
             stubbed.append(p)
         except OSError:
             continue
@@ -579,6 +608,33 @@ def run_bambu(kernel_sources, out_dir: str, top_fname: str,
         res.top_module = detect_top_module(res.top_verilog, top) or top
 
     if vs:
+        # 先把 initial/$readmemb 烤成常量 case ROM，必须在 _collect_mem
+        # 之前，否则占位文件是为已经不存在的 $readmem 生成的。
+        if bcfg.synth_cleanup:
+            for v in vs:
+                rom = make_rom_synthesizable(v, [work])
+                res.rom_files_baked.extend(rom.files_baked)
+                res.rom_readmem_removed += rom.readmem_removed
+                for w in rom.warnings:
+                    res.warnings.append(w)
+            if res.rom_readmem_removed:
+                res.warnings.append(
+                    f"ROM 合成化改写：{res.rom_readmem_removed} 处 "
+                    f"initial/$readmem -> 常量 case，固化 "
+                    f"{len(set(res.rom_files_baked))} 个 .mem")
+            left: Dict[str, int] = {}
+            for v in vs:
+                try:
+                    with open(v, encoding="utf-8", errors="replace") as f:
+                        left = scan_simulation_only(f.read())
+                except OSError:
+                    continue
+            if left:
+                res.unsynthesizable = left
+                res.warnings.append(
+                    "改写后仍有仿真专用构造: "
+                    + ", ".join(f"{k}x{v}" for k, v in sorted(left.items())))
+
         found_mem, stubbed_mem = _collect_mem(work, vs, bcfg.mem_stub)
         res.mem_files = found_mem + stubbed_mem
         res.mem_stubbed = stubbed_mem
