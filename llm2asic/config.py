@@ -52,6 +52,54 @@ class SynthConfig:
 
 
 @dataclass
+class HlsBambuConfig:
+    """Bambu (PandA HLS) 调用配置。"""
+    binary: str = "bambu"
+    device_name: str = "xc7a100t-1csg324-VVD"
+    clock_period: float = 5.0
+    compiler: str = "I386_CLANG16"   # 本地 PandA 只构建了 I386_CLANG16 前端
+    opt_level: str = "-O2"
+    interface: str = "INFER"
+    soft_float: bool = True          # 关掉会缺 functional unit（sqrtf/expf…）
+    faithful_rounding: bool = True   # -DFAITHFULLY_ROUNDED
+    link_libm: bool = True           # -lm
+    experimental_setup: str = ""     # 注意：会自带 -O0，覆盖 opt_level
+    evaluation: str = ""             # 如 PERIOD,AREA,REGISTERS,DSPS,BRAMS
+    simulate: bool = False
+    simulator: str = "VERILATOR"
+    mem_stub: bool = True            # 补齐 .v 引用但缺失的 .mem（全零占位）
+    timeout: int = 3600
+
+
+@dataclass
+class HlsConfig:
+    """HLS（GraphIR -> C++/ONNX -> Bambu）配置。
+
+    这条路径与 ``backend: verilog`` 的原生 RTL 流程完全独立，
+    不做量化，直接在浮点 HLS 内核上编译。
+    """
+    backend: str = "native"          # native | hls4ml | onnx
+    pos: int = 0                     # 编译期已知的位置索引（decode 第 pos 步）
+    run_bambu: bool = True           # 是否把 C++ 继续交给 Bambu 综合
+    verify: bool = True              # 用 g++ + numpy 参考做数值校验（仅 native）
+    rel_tol: float = 1e-4
+    precision: str = "float"         # float | double（仅 native C 内核）
+    # hls4ml
+    hls4ml_precision: str = "float"
+    hls4ml_reuse_factor: int = 1
+    hls4ml_io_type: str = "io_parallel"
+    # native C 内核
+    n_buffers: int = 8
+    pipeline_ii: int = 0             # >0 -> `#pragma HLS PIPELINE II=N`；
+                                     # 默认 0 = 不发（见 c_kernel.CKernelConfig）
+    # RTL 校验：Bambu 出 Verilog 后用 Yosys 展开检查（不做工艺映射）
+    yosys_check: bool = True
+    yosys: str = "yosys"
+    yosys_timeout: int = 3600
+    bambu: HlsBambuConfig = field(default_factory=HlsBambuConfig)
+
+
+@dataclass
 class CompileConfig:
     model_path: str
     out_dir: str = "build_out"
@@ -59,6 +107,7 @@ class CompileConfig:
     quant: QuantConfig = field(default_factory=QuantConfig)
     arch: ArchConfig = field(default_factory=ArchConfig)
     synth: SynthConfig = field(default_factory=SynthConfig)
+    hls: HlsConfig = field(default_factory=HlsConfig)
     # Parser 相关
     input_seq_len: int = 8
     fp_dtype: str = "fp32"
@@ -124,6 +173,42 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
         liberty=str(synth_d.get("liberty", "")),
         clock_period_ns=float(synth_d.get("clock_period_ns", 10.0)),
     )
+    hls_d = raw.get("hls", {}) or {}
+    bambu_d = hls_d.get("bambu", {}) or {}
+    hls = HlsConfig(
+        backend=str(hls_d.get("backend", "native")),
+        pos=int(hls_d.get("pos", 0)),
+        run_bambu=bool(hls_d.get("run_bambu", True)),
+        verify=bool(hls_d.get("verify", True)),
+        rel_tol=float(hls_d.get("rel_tol", 1e-4)),
+        precision=str(hls_d.get("precision", "float")),
+        hls4ml_precision=str(hls_d.get("hls4ml_precision", "float")),
+        hls4ml_reuse_factor=int(hls_d.get("hls4ml_reuse_factor", 1)),
+        hls4ml_io_type=str(hls_d.get("hls4ml_io_type", "io_parallel")),
+        n_buffers=int(hls_d.get("n_buffers", 8)),
+        pipeline_ii=int(hls_d.get("pipeline_ii", 0)),
+        yosys_check=bool(hls_d.get("yosys_check", True)),
+        yosys=str(hls_d.get("yosys", "yosys")),
+        yosys_timeout=int(hls_d.get("yosys_timeout", 3600)),
+        bambu=HlsBambuConfig(
+            binary=str(bambu_d.get("binary", "bambu")),
+            device_name=str(bambu_d.get("device_name",
+                                        HlsBambuConfig.device_name)),
+            clock_period=float(bambu_d.get("clock_period", 5.0)),
+            compiler=str(bambu_d.get("compiler", "I386_CLANG16")),
+            opt_level=str(bambu_d.get("opt_level", "-O2")),
+            interface=str(bambu_d.get("interface", "INFER")),
+            soft_float=bool(bambu_d.get("soft_float", True)),
+            faithful_rounding=bool(bambu_d.get("faithful_rounding", True)),
+            link_libm=bool(bambu_d.get("link_libm", True)),
+            experimental_setup=str(bambu_d.get("experimental_setup", "")),
+            evaluation=str(bambu_d.get("evaluation", "")),
+            simulate=bool(bambu_d.get("simulate", False)),
+            simulator=str(bambu_d.get("simulator", "VERILATOR")),
+            mem_stub=bool(bambu_d.get("mem_stub", True)),
+            timeout=int(bambu_d.get("timeout", 3600)),
+        ),
+    )
     cfg = CompileConfig(
         model_path=model_path or str(build_d.get("model", "")),
         out_dir=out_dir or str(build_d.get("out_dir", "build_out")),
@@ -131,6 +216,7 @@ def parse_config(raw: dict, model_path: str = None, out_dir: str = None) -> Comp
         quant=quant,
         arch=arch,
         synth=synth,
+        hls=hls,
         input_seq_len=int(build_d.get("input_seq_len", 8)),
         fp_dtype=str(build_d.get("fp_dtype", "fp32")),
         n_calib_tokens=int(build_d.get("n_calib_tokens", 8)),

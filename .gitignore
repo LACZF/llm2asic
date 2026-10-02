@@ -7,3 +7,5 @@ dist/
 .pytest_cache/
 build_gds/
 build_reduced/
+build_hls_e2e/
+build_hls/

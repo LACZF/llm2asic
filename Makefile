@@ -9,6 +9,12 @@
 #   make synth      # Yosys 综合，产出最终门级网表 netlist.v（需 yosys）
 #                   #   BACKEND=fpga       -> synth_xilinx（默认）
 #                   #   BACKEND=asic PDK=sky130hd LIBERTY=xxx.lib -> 标准单元网表
+#   make hls        # GraphIR -> HLS C++(/ONNX) -> Bambu -> Verilog（独立于 rtl）
+#                   #   HLS_BACKEND=native(默认)|hls4ml|onnx
+#                   #   自动探测 bambu: 没装则停在 C++/ONNX 并提示
+#                   #   HLS_STRICT=1  缺 bambu 时直接失败
+#                   #   NO_YOSYS_CHECK=1 跳过慢的 Yosys 展开检查(~10min)
+#   make hls-all    # 一次跑完 native/hls4ml/onnx 三条 HLS 路径
 #   make gds        # 一键：RTL -> OpenROAD flow -> 最终 GDS
 #                   #   依赖以 make rtl 生成 RTL(源码模型见 MODEL/OUT)
 #                   #   默认 MODEL=examples/gpt2_tiny/model.yaml OUT=build；
@@ -37,6 +43,29 @@ BACKEND    ?= fpga
 PDK        ?= sky130hd
 LIBERTY    ?=
 
+# HLS 后端配置（与 rtl/synth 流程并列，互不影响）
+HLS_BACKEND ?= native
+HLS_DEVICE  ?=
+HLS_CLOCK_NS ?=
+HLS_COMPILER ?=
+HLS_EVAL    ?=
+# Bambu 自动探测：没装就自动停在 C++/ONNX（并打印提示），
+# 装了则默认一路走到 Verilog。HLS_STRICT=1 可要求缺 Bambu 时直接失败。
+BAMBU       := $(shell command -v bambu 2>/dev/null)
+HLS_STRICT  ?= 0
+NO_BAMBU    ?= $(if $(strip $(BAMBU)),0,1)
+HLS_NO_BAMBU_FLAG := $(if $(filter 1,$(NO_BAMBU)),--no-bambu)
+# Yosys 展开检查对 gpt2_tiny 要 ~10 分钟(1241 个模块)，NO_YOSYS_CHECK=1 可跳过
+NO_YOSYS_CHECK ?= 0
+HLS_NO_YOSYS_FLAG := $(if $(filter 1,$(NO_YOSYS_CHECK)),--no-yosys-check)
+ifeq ($(strip $(BAMBU)),)
+HLS_BAMBU_MISSING := 1
+# 每条单独一行, 且不得含单/双引号或反引号(会被 shell 打印)
+HLS_NOTE1 := ==> NOTE: 未检测到 bambu 可执行文件，本次只生成 HLS C++/ONNX，不综合成 Verilog。
+HLS_NOTE2 := ==>       安装 Bambu 后重跑即可得到 Verilog: https://github.com/ferrandi/PandA-bambu
+HLS_NOTE3 := ==>       强制要求 bambu 时用: make hls HLS_STRICT=1
+endif
+
 # GDS 一键流程配置
 GDS_PLATFORM   ?= sky130hd
 GDS_SKIP_DRT   ?= 1
@@ -44,7 +73,7 @@ GDS_TOP        ?=
 SINGLE         ?= 0
 RTL_SINGLE     := $(if $(filter 1,$(SINGLE)),--single-file)
 
-.PHONY: help all test rtl rtl-all synth gds lint lint-all clean
+.PHONY: help all test rtl rtl-all synth gds lint lint-all hls hls-all clean
 
 help:
 	@echo "LLM2ASIC 常用命令（也直接支持 make 子命令: test/rtl/synth/gds/clean）"
@@ -59,6 +88,8 @@ help:
 	@echo "  make lint       # Verilator 检查 RTL, 报告到 \$(MODEL_OUT)/lint_report.txt"
 	@echo "  make lint-all   # 对 examples/ 下全部模型逐个 lint"
 	@echo "  make synth      # Yosys 综合出网表 (BACKEND=fpga|asic, PDK, LIBERTY=)"
+	@echo "  make hls        # HLS 路径: GraphIR -> C++(/ONNX) -> Bambu -> Verilog"
+	@echo "                  #   自动探测 bambu; 缺 Bambu 则停在 C++/ONNX 并提示"
 	@echo "  make gds        # 一键 RTL->OpenROAD flow->最终 GDS (需 iverilog/yosys/OpenROAD)"
 	@echo "  make clean      # 清理构建产物与缓存"
 	@echo ""
@@ -71,12 +102,17 @@ help:
 	@echo "  GDS_TOP=名字    顶层模块名 (默认从 OUT/*/rtl/*_accel.sv 推断)"
 	@echo "  ORFS=路径       OpenROAD-flow-scripts 根目录 (自动探测)"
 	@echo "  BACKEND=        synth 后端: fpga(默认)|asic   PDK=/LIBERTY= (asic 用)"
+	@echo "  HLS_BACKEND=    HLS 路径: native(默认)|hls4ml|onnx"
+	@echo "  HLS_STRICT=1    缺 bambu 时直接失败(默认自动降级为只出 C++)"
+	@echo "  HLS_DEVICE=/HLS_CLOCK_NS=/HLS_COMPILER=/HLS_EVAL=  透传给 Bambu"
 	@echo ""
 	@echo "示例:"
 	@echo "  make gds"
 	@echo "  make gds MODEL=examples/llama_tiny/model.yaml OUT=build_llama"
 	@echo "  make rtl SINGLE=1"
 	@echo "  make rtl-all OUT=build_out"
+	@echo "  make hls NO_BAMBU=1"
+	@echo "  make hls HLS_BACKEND=hls4ml NO_BAMBU=1 OUT=build_hls"
 
 all: test rtl
 
@@ -143,6 +179,45 @@ lint-all:
 test:
 	@echo "==> [pytest] 运行测试"
 	@PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m pytest
+
+# HLS 路径（与 rtl 并列，独立开关）：GraphIR -> C++(/ONNX) -> Bambu -> Verilog
+#   HLS_BACKEND=native   自研 C 内核（默认，无需第三方 HLS 工具）
+#   HLS_BACKEND=hls4ml   走 hls4ml 生成的 HLS C++ 工程
+#   HLS_BACKEND=onnx     只导出单步 decode ONNX
+#   NO_BAMBU=1           停在 C++/ONNX，不调用 Bambu（无 HLS 工具链时用）
+hls:
+	$(if $(HLS_BAMBU_MISSING),@echo '$(HLS_NOTE1)')
+	$(if $(HLS_BAMBU_MISSING),@echo '$(HLS_NOTE2)')
+	$(if $(HLS_BAMBU_MISSING),@echo '$(HLS_NOTE3)')
+	@if [ -n "$(HLS_BAMBU_MISSING)" ] && [ "$(HLS_STRICT)" = "1" ]; then \
+		echo "==> ERROR: HLS_STRICT=1 但未找到 bambu"; exit 1; fi
+	@echo "==> [hls_backend] $(HLS_BACKEND) -> $(MODEL_OUT)/hls (bambu=$(if $(filter 1,$(NO_BAMBU)),关,开))"
+	@PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m llm2asic hls \
+		--model $(MODEL) --out $(MODEL_OUT) \
+		--hls-backend $(HLS_BACKEND) \
+		$(HLS_NO_BAMBU_FLAG) \
+		$(if $(HLS_DEVICE),--device $(HLS_DEVICE)) \
+		$(if $(HLS_CLOCK_NS),--clock-period $(HLS_CLOCK_NS)) \
+		$(if $(HLS_COMPILER),--compiler $(HLS_COMPILER)) \
+		$(HLS_NO_YOSYS_FLAG) \
+		$(if $(HLS_EVAL),--evaluate $(HLS_EVAL))
+	@echo "==> [hls] 完成。产物: $(MODEL_OUT)/hls/"
+
+# 三条 HLS 路径各跑一遍，输出到 $(MODEL_OUT)/hls/<backend>/
+hls-all:
+	@set -e; for b in native hls4ml onnx; do \
+		echo "==> [hls_backend] $$b"; \
+		$(MAKE) --no-print-directory hls HLS_BACKEND=$$b \
+			NO_BAMBU=$(NO_BAMBU) HLS_STRICT=$(HLS_STRICT) \
+			NO_YOSYS_CHECK=$(NO_YOSYS_CHECK) \
+			HLS_DEVICE=$(HLS_DEVICE) \
+			HLS_CLOCK_NS=$(HLS_CLOCK_NS) HLS_COMPILER=$(HLS_COMPILER) \
+			HLS_EVAL=$(HLS_EVAL) OUT=$(OUT) MODEL=$(MODEL); \
+	done
+	@echo "==> [hls-all] 三条路径完成:"
+	@echo "     native : $(MODEL_OUT)/hls/hls/llm2asic_kernel.cpp"
+	@echo "     hls4ml : $(MODEL_OUT)/hls/hls4ml/<project>/<project>_bridge.cpp"
+	@echo "     onnx   : $(MODEL_OUT)/hls/*.onnx"
 
 # Yosys 综合（开源流程）：在 RTL 目录运行，产出门级网表到 $(OUT)/synth/
 synth: rtl

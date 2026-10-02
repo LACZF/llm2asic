@@ -18,6 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 torch = ["torch", "safetensors"]
+# HLS 后端：onnx 用于导出/校验 ONNX，hls4ml 用于生成 HLS C++ 工程。
+# 注意：Bambu(PandA) 不是 pip 包，需自行安装 https://github.com/ferrandi/PandA-bambu
+hls = ["onnx>=1.14", "hls4ml>=1.3"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
